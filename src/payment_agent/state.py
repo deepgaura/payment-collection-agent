@@ -1,13 +1,23 @@
-"""Conversation state.
+"""
+WHAT THIS FILE IS (in one line):
+    The "notebook" - the data that remembers everything about one conversation.
 
-A single `SessionState` instance holds everything the agent needs to know
-about one conversation. It is owned by the `Agent` object and mutated only by
-the deterministic orchestrator. The LLM never touches this directly.
+IT'S JUST DATA (no decisions):
+    This file only DEFINES the shapes we store. The brain (orchestrator.py)
+    reads and writes these; agent.py owns one SessionState per chat. The LLM
+    never touches this directly.
 
-Security note: card data (PAN/CVV) is held only transiently in `card` while a
-payment is being assembled and is wiped via `clear_card()` as soon as a
-terminal payment outcome is reached. Sensitive account fields (dob, aadhaar,
-pincode) live in `account` and are NEVER rendered back to the user.
+WHAT'S IN HERE:
+    Step          - an enum of the conversation stages (greeting, verify, pay...)
+    Account       - the real account info from the API (SENSITIVE - never shown)
+    IdentityClaim - what the USER claims (compared against Account by verifier)
+    CardDetails   - card fields, held only while building a payment (then wiped)
+    SessionState  - the whole notebook: current step + all of the above + counters
+
+SECURITY NOTE:
+    Card number/CVV live only in `card` while assembling a payment and are wiped
+    by clear_card() the moment the payment ends. The real DOB/Aadhaar/pincode
+    live in `account` and are NEVER put into a message to the user.
 """
 
 from __future__ import annotations
@@ -18,11 +28,13 @@ from typing import Optional
 
 
 class Step(str, Enum):
-    """The stages of the collection flow, in order.
+    """
+    The stages of the conversation, in order. `SessionState.step` always holds
+    exactly one of these - it's "which page of the form are we on".
 
-    Using an explicit enum (rather than free-form strings) makes the state
-    machine auditable and prevents illegal transitions such as jumping to
-    payment before verification.
+    Using named steps (instead of loose strings) means the code can't
+    accidentally jump to, say, payment before verification - the flow only moves
+    one step at a time.
     """
 
     GREETING = "greeting"              # waiting to greet / for first message
@@ -36,21 +48,25 @@ class Step(str, Enum):
     CLOSED_FAILURE = "closed_failure"  # terminal: gave up / unrecoverable
 
 
-# Steps after which the conversation is over and next() should just restate the
-# closing message.
+# The two "the conversation is over" steps. If we're on one of these, next()
+# just restates the closing message.
 TERMINAL_STEPS = frozenset({Step.CLOSED_SUCCESS, Step.CLOSED_FAILURE})
 
 
 class MalformedAccountError(ValueError):
-    """Raised when the lookup API returns a body we can't parse into an Account.
-
-    The orchestrator catches this and degrades gracefully instead of letting it
-    crash the turn (the `next()` contract must never raise)."""
+    """
+    Thrown if the lookup API gives back a body we can't read into an Account
+    (missing fields, weird balance). The orchestrator catches this and shows a
+    graceful "try again" instead of crashing the turn.
+    """
 
 
 @dataclass
 class Account:
-    """Account data returned by the lookup API. Treated as sensitive."""
+    """
+    The real account data from the lookup API. This is SENSITIVE - the verifier
+    compares against it, but its values are never shown to the user.
+    """
 
     account_id: str
     full_name: str
@@ -61,11 +77,11 @@ class Account:
 
     @classmethod
     def from_api(cls, data: dict) -> "Account":
-        """Build an Account from a lookup response, validating shape.
-
-        Raises MalformedAccountError (never a bare KeyError/ValueError) if a
-        required field is missing or the balance isn't numeric, so callers have
-        a single, typed failure to handle."""
+        """
+        Build an Account from the API's JSON, checking it has all the fields we
+        need. If something's missing or the balance isn't a number, raise
+        MalformedAccountError (one clean error type) instead of a random crash.
+        """
         if not isinstance(data, dict):
             raise MalformedAccountError("lookup response was not an object")
         required = ("account_id", "full_name", "dob", "aadhaar_last4", "pincode", "balance")
@@ -88,25 +104,28 @@ class Account:
 
 @dataclass
 class IdentityClaim:
-    """What the *user* has claimed so far during verification.
-
-    These are compared against `Account` by the verifier. They are the user's
-    assertions, not trusted facts.
+    """
+    What the USER says about themselves during verification. These are just
+    claims (not trusted) - the verifier compares them against the real Account.
     """
 
     full_name: Optional[str] = None
-    dob: Optional[str] = None            # normalised to YYYY-MM-DD when parsed
+    dob: Optional[str] = None            # stored as YYYY-MM-DD once parsed
     aadhaar_last4: Optional[str] = None
     pincode: Optional[str] = None
 
     def has_secondary_factor(self) -> bool:
+        # True if the user has given at least ONE of dob/aadhaar/pincode.
+        # (Verification needs the name + at least one of these.)
         return any((self.dob, self.aadhaar_last4, self.pincode))
 
 
 @dataclass
 class CardDetails:
-    """Transient card data. Cleared as soon as payment reaches a terminal
-    outcome. Never logged in raw form."""
+    """
+    The card fields, held ONLY while we're building a payment. Wiped as soon as
+    the payment finishes (success/cancel/failure). Never written to logs raw.
+    """
 
     cardholder_name: Optional[str] = None
     card_number: Optional[str] = None       # digits only
@@ -115,6 +134,7 @@ class CardDetails:
     expiry_year: Optional[int] = None
 
     def is_complete(self) -> bool:
+        # True only when ALL four card fields are filled in.
         return all(
             v is not None
             for v in (
@@ -127,12 +147,10 @@ class CardDetails:
         )
 
     def next_missing_field(self) -> Optional[str]:
-        """Return the FIRST still-missing card field, in the order we ask for
-        them (number -> expiry -> cvv -> name), or None if complete.
-
-        Collecting one field at a time gives a natural, call-centre-like flow.
-        We still accept multiple fields in one message (greedy capture upstream);
-        this only decides which single field to *prompt* for next.
+        """
+        Return the name of the NEXT card field we still need, in ask-order
+        (number -> expiry -> cvv -> name), or None if the card is complete.
+        The orchestrator uses this to ask for one field at a time.
         """
         if not self.card_number:
             return "card_number"
@@ -147,44 +165,45 @@ class CardDetails:
 
 @dataclass
 class SessionState:
-    """The complete state of one conversation."""
+    """
+    THE NOTEBOOK - everything we remember about one conversation. One of these
+    is created per Agent and passed around so every part shares the same memory.
+    """
 
-    step: Step = Step.GREETING
+    step: Step = Step.GREETING          # which stage we're on (starts at greeting)
 
-    # Populated after a successful account lookup.
-    account: Optional[Account] = None
+    account: Optional[Account] = None   # filled in after a successful lookup
 
-    # The user's identity claims (compared against `account`).
-    claim: IdentityClaim = field(default_factory=IdentityClaim)
-    is_verified: bool = False
+    claim: IdentityClaim = field(default_factory=IdentityClaim)  # what the user claimed
+    is_verified: bool = False           # have they passed verification?
 
-    # Payment intent.
+    # What they're paying:
     amount: Optional[float] = None
     card: CardDetails = field(default_factory=CardDetails)
 
-    # Outcome.
-    transaction_id: Optional[str] = None
+    transaction_id: Optional[str] = None  # set once a payment succeeds
 
-    # Retry accounting.
+    # --- "how many tries" counters (for the retry limits) ---
     verification_attempts: int = 0
     payment_attempts: int = 0
     account_lookup_attempts: int = 0
     network_failures: int = 0
-    # Consecutive turns that made no progress (no step change, no new usable
-    # data). Bounds conversations where the user never supplies what's needed
-    # so the agent can't loop forever.
+    # Turns in a row where nothing moved forward -> used to end a stuck chat.
     no_progress_turns: int = 0
 
-    # Per-turn scratch: values extracted this turn that a step handler consumes.
-    # Kept as declared fields (not ad-hoc attributes) so all state is explicit.
-    pending_account_id: Optional[str] = None
-    pending_amount: Optional[float] = None
-    pending_pay_full: bool = False
-    unclear_secondary: bool = False
+    # --- one-turn scratchpad ---
+    # Things the extractor found THIS turn that a handler will use in a moment.
+    # (Kept as real fields so all state is visible in one place.)
+    pending_account_id: Optional[str] = None   # account id waiting to be looked up
+    pending_amount: Optional[float] = None      # amount waiting to be validated
+    pending_pay_full: bool = False              # user said "pay the full amount"
+    unclear_secondary: bool = False             # gave a number we couldn't classify
 
     def clear_card(self) -> None:
-        """Wipe transient card data. Called on any terminal payment outcome."""
+        """Wipe the card data (replace with a fresh empty one). Called whenever
+        a payment ends - success, cancel, or failure."""
         self.card = CardDetails()
 
     def is_terminal(self) -> bool:
+        # True if the conversation has ended (success or failure).
         return self.step in TERMINAL_STEPS

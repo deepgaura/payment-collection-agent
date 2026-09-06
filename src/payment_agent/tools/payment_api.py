@@ -1,20 +1,18 @@
-"""HTTP client for the payment / verification API.
+"""
+WHAT THIS FILE IS (in one line):
+    The only part that talks to the real payment server over the internet.
 
-Two endpoints:
-  POST /api/lookup-account   -> account details (used for in-agent verification)
-  POST /api/process-payment  -> processes a card payment
+TWO THINGS IT CAN DO:
+    lookup_account(id)     -> fetch an account's details (used to verify)
+    process_payment(...)   -> actually charge the card
 
-Design points:
-- Every call returns a normalised `ApiResult` instead of raising, so the
-  orchestrator has a single, total contract to reason about.
-- Only *transient* failures (network errors, 5xx) are retried automatically.
-  Business responses (404 account_not_found, 422 invalid_amount, ...) are
-  returned as-is; retrying them would be pointless and could double-charge.
-- Observed reality: the server sometimes returns HTTP 400 `invalid_args` for
-  bad expiry / CVV instead of the documented granular codes. We surface the
-  raw error_code untouched; user-facing precision comes from client-side
-  validation, not from this mapping.
-- Card data is never logged. Request logging is redacted.
+KEY IDEAS:
+    - Every call returns an `ApiResult` (never throws). So the orchestrator has
+      one simple thing to check: ok? error? network problem?
+    - Only "temporary" problems (no internet, server 5xx) are retried. Real
+      answers like "account not found" or "insufficient balance" are returned
+      as-is - retrying them would be pointless (and could double-charge).
+    - Card details are NEVER written to the logs (they're masked first).
 """
 
 from __future__ import annotations
@@ -33,28 +31,29 @@ logger = logging.getLogger("payment_agent.api")
 
 @dataclass
 class ApiResult:
-    """Normalised outcome of an API call.
-
-    Exactly one conceptual mode applies:
-      - ok=True                       -> `data` holds the parsed JSON body
-      - ok=False, error_code set      -> a business error the server reported
-      - ok=False, network_error=True  -> transient/transport failure
+    """
+    The tidy result of any API call. Exactly one of these situations is true:
+      - ok=True                      -> success; `data` has the JSON reply
+      - ok=False + error_code        -> the server said no (e.g. "invalid_card")
+      - ok=False + network_error     -> couldn't reach the server at all
     """
 
     ok: bool
-    status_code: Optional[int] = None
-    data: Optional[dict] = None
-    error_code: Optional[str] = None
+    status_code: Optional[int] = None   # the HTTP number (200, 404, 422...)
+    data: Optional[dict] = None         # the reply body, on success
+    error_code: Optional[str] = None    # the server's error code, on failure
     message: Optional[str] = None
     network_error: bool = False
 
     @property
     def is_transient(self) -> bool:
+        # "Temporary" trouble worth retrying: no connection, or a server-side
+        # 5xx error. (A 404/422 is a real answer, not temporary.)
         return self.network_error or (self.status_code is not None and self.status_code >= 500)
 
 
 class PaymentApiClient:
-    """Thin, retry-aware wrapper around the two endpoints."""
+    """A thin wrapper that calls the two endpoints and retries temporary errors."""
 
     def __init__(
         self,
@@ -66,8 +65,10 @@ class PaymentApiClient:
         self._session = session or requests.Session()
         self._metrics = metrics  # optional Metrics collector; None = no-op
 
-    # --- public endpoints -------------------------------------------------- #
+    # --- the two things callers use ---------------------------------------- #
     def lookup_account(self, account_id: str) -> ApiResult:
+        # Ask the server for this account's details. (redact=False: nothing
+        # secret in this request, so it's fine to log as-is.)
         return self._post("/api/lookup-account", {"account_id": account_id}, redact=False)
 
     def process_payment(
@@ -95,18 +96,19 @@ class PaymentApiClient:
                 },
             },
         }
-        # redact=True => card fields never reach the logs.
+        # redact=True => card details are masked before anything is logged.
         return self._post("/api/process-payment", payload, redact=True)
 
-    # --- internals --------------------------------------------------------- #
+    # --- the shared "send the request" method ------------------------------ #
     def _post(self, path: str, payload: dict, *, redact: bool) -> ApiResult:
+        # Build the full URL and figure out how many tries we're allowed.
         url = self._config.base_url.rstrip("/") + path
         attempts = self._config.network_max_retries + 1
         last: Optional[ApiResult] = None
-        # Metric name derived from the endpoint, e.g. "api.lookup-account".
-        metric = "api." + path.rsplit("/", 1)[-1]
-        started = time.perf_counter()
+        metric = "api." + path.rsplit("/", 1)[-1]   # e.g. "api.lookup-account"
+        started = time.perf_counter()               # for latency metric
 
+        # Try up to `attempts` times, but ONLY retry temporary problems.
         for attempt in range(attempts):
             self._log_request(path, payload, redact, attempt)
             try:
@@ -119,9 +121,10 @@ class PaymentApiClient:
             else:
                 last = self._parse_response(resp)
 
+            # Success, OR a real (non-temporary) answer -> stop, return it.
             if last.ok or not last.is_transient:
                 break
-            # transient: count a retry, back off, and try again
+            # Temporary problem -> wait a bit and try again.
             self._m_incr(f"{metric}.retry")
             if attempt < attempts - 1:
                 time.sleep(self._config.network_retry_backoff_seconds * (attempt + 1))
@@ -146,14 +149,16 @@ class PaymentApiClient:
             self._metrics.record_ms(name, ms)
 
     def _parse_response(self, resp: requests.Response) -> ApiResult:
+        # Turn the raw HTTP response into our tidy ApiResult.
         status = resp.status_code
         try:
             body = resp.json()
         except ValueError:
-            body = {}
+            body = {}   # server sent non-JSON; treat as empty
 
         if status == 200:
-            # process-payment returns success flag; lookup returns account data.
+            # 200 = OK. But process-payment can still say {"success": false} on
+            # a 200, so check that. lookup just returns the account data.
             if body.get("success") is False:
                 return ApiResult(
                     ok=False,
@@ -180,7 +185,11 @@ class PaymentApiClient:
 
 
 def _redact_payload(payload: dict) -> dict:
-    """Return a copy of a payment payload with card secrets masked for logging."""
+    """
+    Make a SAFE copy of a payment request for logging: mask the card number
+    (show only last 4) and hide the CVV entirely. So logs never contain real
+    card secrets. e.g. "4532015112830366" -> "************0366", cvv -> "***".
+    """
     try:
         card = payload["payment_method"]["card"]
     except (KeyError, TypeError):

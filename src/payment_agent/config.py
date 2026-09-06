@@ -1,8 +1,17 @@
-"""Central configuration for the payment agent.
+"""
+WHAT THIS FILE IS (in one line):
+    All the knobs/settings in one place (API URL, timeouts, retry limits, which
+    LLM to use). Nothing here makes decisions - it just holds numbers and flags.
 
-All tunables live here so behaviour is easy to audit and adjust. Values can be
-overridden via environment variables to keep secrets and deployment specifics
-out of the code.
+HOW SETTINGS ARE CHOSEN:
+    Each setting has a sensible default, but can be overridden with an
+    environment variable (often set in a local `.env` file). So you can change
+    behaviour without touching code - e.g. set USE_LLM=false to run offline.
+
+WHO READS IT:
+    Basically everyone: the API client (URL/timeouts), the orchestrator (retry
+    limits), agent.py (which LLM/phraser to build). One shared `DEFAULT_CONFIG`
+    is created at the bottom.
 """
 
 from __future__ import annotations
@@ -10,10 +19,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# Load a local .env file (if present) so secrets like OPENAI_API_KEY can live
-# outside the code and outside version control. This is best-effort: if
-# python-dotenv isn't installed, we silently rely on real environment variables,
-# so the app never breaks for anyone who didn't install it.
+# Load a local ".env" file (if there is one) so secrets like the API key live
+# outside the code (and outside git). If python-dotenv isn't installed, we just
+# fall back to the real environment - the app still runs.
 try:
     from dotenv import load_dotenv
 
@@ -33,7 +41,7 @@ DEFAULT_BASE_URL = (
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    """Parse a boolean environment variable consistently."""
+    """Read a true/false setting from an env var. "true"/"1"/"yes"/"on" -> True."""
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -42,10 +50,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Config:
-    """Immutable runtime configuration.
-
-    Frozen so it cannot be mutated mid-conversation, which keeps behaviour
-    deterministic across the lifetime of an Agent instance.
+    """
+    All the settings, read once when the agent starts. It's "frozen" (can't be
+    changed after creation) so behaviour stays consistent for the whole chat.
+    Each field below reads an env var (with a default) - the comments explain
+    what each one does.
     """
 
     # --- API client ---
@@ -149,7 +158,12 @@ class Config:
 
     @property
     def llm_available(self) -> bool:
-        """True if an LLM backend is usable given current config."""
+        """
+        Can we actually use an LLM right now? Only if it's turned on AND we have
+        what that provider needs (a Vertex project id, or an OpenAI key).
+        agent.py checks this before building the LLM extractor/phraser; if it's
+        False, the agent quietly uses the regex fallback instead.
+        """
         if not self.use_llm:
             return False
         if self.llm_provider == "vertex":
@@ -157,5 +171,5 @@ class Config:
         return bool(self.llm_api_key)
 
 
-# A module-level default that most callers can share.
+# One ready-made Config that most of the code shares by default.
 DEFAULT_CONFIG = Config()

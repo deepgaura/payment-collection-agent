@@ -1,18 +1,29 @@
-"""User-facing message templates.
+"""
+WHAT THIS FILE IS (in one line):
+    Every sentence the agent ever says to the user lives here.
 
-All strings the user ever sees are produced here, which gives us one place to
-audit for the hard rule: NEVER echo sensitive account data (DOB, Aadhaar,
-pincode) back to the user. None of these templates accept those values.
+WHY ALL IN ONE PLACE:
+    - One spot to read/tweak the wording and tone.
+    - One spot to guarantee the hard rule: we NEVER print the stored DOB /
+      Aadhaar / pincode. (Notice none of these functions even take those values -
+      the only account detail they accept is the balance and the account id.)
 
-Messages are deterministic given their inputs, keeping the agent reproducible.
+HOW IT'S USED:
+    orchestrator.py picks the right message from here each turn. Some are plain
+    strings (constants); some are functions that fill in a number (like the
+    balance or the amount). The optional phraser.py may reword the *safe* ones
+    to sound friendlier, but sensitive ones (balance/recap/errors) are shown
+    exactly as written here.
 """
 
 from __future__ import annotations
 
-from .validators import format_currency
+from .validators import format_currency   # turns 1250.75 into "₹1,250.75"
 
 
 class Responses:
+    # Below: constants (fixed text) and small functions (text with a number
+    # filled in). Grouped by the step they belong to.
     # --- greeting / account ------------------------------------------------ #
     GREETING = "Hello! I can help you clear your outstanding balance. To get started, could you share your account ID?"
 
@@ -231,9 +242,11 @@ class Responses:
     ALREADY_CLOSED = "This session has ended. Please start a new conversation if you'd like to make a payment."
 
 
-# Maps API error codes to (user_message, is_terminal).
-# Precise, user-fixable guidance for the common cases; card-format problems are
-# fixable (re-collect the card), balance/amount are fixable (re-ask amount).
+# When a payment fails, this table tells the orchestrator two things per error:
+#   1) the message to show the user, and
+#   2) is it TERMINAL? (True = give up/close, False = user can fix it and retry)
+# Example: "invalid_card" -> tell them to try another card, and it's fixable
+# (False), so we let them re-enter the card. "account_not_found" is terminal.
 PAYMENT_ERROR_GUIDANCE: dict[str, tuple[str, bool]] = {
     "invalid_card": ("That card was declined as invalid. Please check the number and try a different card.", False),
     "invalid_cvv": ("The CVV wasn't accepted. Please re-check the CVV.", False),
