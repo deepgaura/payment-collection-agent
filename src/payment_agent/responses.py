@@ -135,6 +135,15 @@ class Responses:
             field, "Could you share the remaining card detail?"
         )
 
+    # Shown when the fully-collected card fails local validation. Deliberately
+    # GENERIC: we do NOT say which field was wrong (number / expiry / CVV), so
+    # we don't hand a card-tester a hint about which part checks out. The user
+    # re-enters the full set. (Format checks only - no stored data revealed.)
+    CARD_DETAILS_INVALID = (
+        "Sorry, those card details couldn't be validated. Please double-check "
+        "your card number, expiry date, and CVV, and enter them again."
+    )
+
     # --- confirmation before charging -------------------------------------- #
     @staticmethod
     def confirm_payment(amount: float, card_last4: str, exp_month: int, exp_year: int) -> str:

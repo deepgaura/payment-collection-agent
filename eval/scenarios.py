@@ -255,8 +255,10 @@ def all_scenarios() -> list[Scenario]:
                 Turn("Nithin Jain", []),
                 Turn("dob 1990-05-14", [verified(True)]),
                 Turn("pay 500", [msg_contains("card")]),
+                # Bad card (Luhn fail) -> rejected locally with a GENERIC message
+                # (we don't say which field was wrong), and no API call.
                 Turn("card 1234 5678 9012 3456 exp 12/2027 cvv 123 name Nithin Jain",
-                     [msg_contains("validation"), never_charged()]),  # rejected before any API call
+                     [msg_contains("couldn't be validated"), never_charged()]),
             ],
             final_checks=[verified(True), never_charged()],
         ),
@@ -270,8 +272,10 @@ def all_scenarios() -> list[Scenario]:
                 Turn("Nithin Jain", []),
                 Turn("dob 1990-05-14", [verified(True)]),
                 Turn("pay 500", []),
+                # Expired card -> same GENERIC "couldn't be validated" message
+                # (we don't disclose that it was specifically the expiry), no API call.
                 Turn("4532 0151 1283 0366, exp 01/2020, cvv 123, name Nithin Jain",
-                     [msg_contains("expired"), never_charged()]),
+                     [msg_contains("couldn't be validated"), never_charged()]),
             ],
             final_checks=[verified(True), never_charged()],
         ),

@@ -522,24 +522,19 @@ class Orchestrator:
             # Still missing something -> ask for just the next field.
             return Responses.ask_card_field(card.next_missing_field())
 
-        # All fields present -> check each one locally BEFORE calling the API,
-        # so we can give a precise reason if something's wrong.
+        # All four fields are in. Validate them together (number/expiry/CVV).
+        # SECURITY CHOICE: if ANY check fails we do NOT reveal which one - we
+        # clear the whole card and show a single generic "couldn't validate,
+        # re-enter" message. Naming the bad field would help a card-tester probe
+        # which parts of a stolen card are valid. These are format checks only,
+        # so nothing stored/secret is exposed either way.
         num = validate_card_number(card.card_number)
-        if not num.ok:
-            card.card_number = None
-            return num.reason
-        card.card_number = num.value  # normalised digits
-
-        cvv = validate_cvv(card.cvv, card.card_number)
-        if not cvv.ok:
-            card.cvv = None
-            return cvv.reason
-
+        cvv = validate_cvv(card.cvv, card.card_number) if num.ok else None
         exp = validate_expiry(card.expiry_month, card.expiry_year)
-        if not exp.ok:
-            card.expiry_month = None
-            card.expiry_year = None
-            return exp.reason
+        if not num.ok or cvv is None or not cvv.ok or not exp.ok:
+            state.clear_card()   # wipe everything; user re-enters the full set
+            return Responses.CARD_DETAILS_INVALID
+        card.card_number = num.value  # normalised digits
 
         # All valid -> ask for explicit confirmation before charging (no charge
         # happens yet). The summary shows only a safe subset (amount + card
