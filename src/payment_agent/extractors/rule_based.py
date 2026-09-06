@@ -138,6 +138,12 @@ class RuleBasedExtractor:
         # "14th May 1990") and let the strict date parser handle it later.
         result.dob_text = self._dob_text(text)
 
+        # IMPORTANT: remove any account token like "ACC-1001" from the text
+        # BEFORE we hunt for Aadhaar/pincode digits. Otherwise the "1001" inside
+        # an account id would be mistaken for a 4-digit Aadhaar. We only mine
+        # the *remaining* text for identity numbers.
+        text = re.sub(r"\bacc\W*?\d{3,}\b", " ", text, flags=re.I)
+
         # Aadhaar (4 digits) vs pincode (6 digits). First try to find them when
         # the user LABELS them, e.g. "aadhaar 4321" or "pincode 400001".
         low = text.lower()

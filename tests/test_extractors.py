@@ -57,6 +57,18 @@ def test_aadhaar_ends_with():
     assert r.aadhaar_last4 == "9876"
 
 
+def test_account_token_digits_not_mistaken_for_aadhaar():
+    """Digits inside an account token (e.g. "ACC-1001") must NOT be captured as
+    an Aadhaar/pincode - otherwise restating an account id would pollute the
+    identity claim and waste a verification attempt."""
+    r = EX.extract("Sorry, I mean my account was ACC-1001", Expecting.IDENTITY)
+    assert r.aadhaar_last4 is None
+    assert r.pincode is None
+    # A real labelled factor alongside an account token is still captured.
+    r2 = EX.extract("my aadhaar is 4321 and acc ACC1001", Expecting.IDENTITY)
+    assert r2.aadhaar_last4 == "4321"
+
+
 # --- Amount ---------------------------------------------------------------- #
 def test_amount_words():
     assert EX.extract("I want to pay a thousand rupees", Expecting.AMOUNT).amount == 1000.0
