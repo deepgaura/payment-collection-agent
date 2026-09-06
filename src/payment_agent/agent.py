@@ -102,6 +102,8 @@ class Agent:
             self.metrics.incr(f"extraction.source.{extracted.source}")
             if "llm_failed" in extracted.notes:
                 self.metrics.incr("extraction.llm_failed")
+            if "schema_invalid" in extracted.notes:
+                self.metrics.incr("extraction.schema_invalid")
         except Exception:
             # A turn must NEVER crash. If the translator blew up, use an empty
             # result (the brain will then just re-ask for what it needs).

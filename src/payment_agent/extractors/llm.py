@@ -29,8 +29,32 @@ from typing import Optional
 from ..config import Config
 from .base import Expecting, ExtractionResult
 from .rule_based import RuleBasedExtractor
+from .schema import EXTRACTION_SCHEMA
 
 logger = logging.getLogger("payment_agent.llm")
+
+
+def _validate_against_schema(data: dict) -> None:
+    """
+    Final gate: check the model's reply really matches our schema.
+
+    Provider schema-enforcement is great but not universal (older libs, plain
+    JSON fallback). So we ALSO validate here. If jsonschema isn't installed we
+    skip silently - the strict type-coercion in _to_result is still a safety
+    net. A schema violation raises, which the caller turns into a regex
+    fallback (never a crash).
+    """
+    try:
+        import jsonschema
+    except Exception:
+        return  # library not present -> rely on coercion instead
+    jsonschema.validate(instance=data, schema=EXTRACTION_SCHEMA)
+
+
+def _is_schema_error(exc: Exception) -> bool:
+    """True if this exception came from schema validation (vs a network/LLM
+    failure). Used only to tag the fallback note for metrics/debugging."""
+    return exc.__class__.__name__ in ("ValidationError", "SchemaError")
 
 # ---------------------------------------------------------------------------
 # THE RULEBOOK WE SEND THE LLM (the "system prompt").
@@ -115,10 +139,14 @@ class LLMExtractor:
         try:
             llm_result = self._call_llm(text, expecting)
         except Exception as exc:
-            # If the LLM errored (timeout/network/bad JSON), DON'T crash - just
-            # use the regex result and make a note that the LLM failed.
-            logger.warning("LLM extraction failed (%s); using rule-based only.", exc.__class__.__name__)
-            rule_based.notes.append("llm_failed")
+            # If the LLM errored (timeout/network/bad JSON/schema violation),
+            # DON'T crash - use the regex result and note why we fell back.
+            note = "schema_invalid" if _is_schema_error(exc) else "llm_failed"
+            logger.warning(
+                "LLM extraction failed (%s: %s); using rule-based only.",
+                note, exc.__class__.__name__,
+            )
+            rule_based.notes.append(note)
             return rule_based
 
         # 3) LLM leads; regex fills the gaps. Return the combined form.
@@ -133,8 +161,12 @@ class LLMExtractor:
             f'user_message: {json.dumps(text)}\n'
             f"Extract the fields as specified and return ONLY the JSON object."
         )
-        # Ask the LLM for JSON, then turn that JSON into our form object.
-        data = self._client.complete_json(SYSTEM_PROMPT, user_prompt)
+        # Ask the LLM for JSON, forcing the provider to match our schema where
+        # supported. We pass the schema so structure is enforced at the source.
+        data = self._client.complete_json(SYSTEM_PROMPT, user_prompt, schema=EXTRACTION_SCHEMA)
+        # Final gate: validate the reply really matches the schema before we
+        # trust it. (Raises on violation -> caller falls back to regex.)
+        _validate_against_schema(data)
         return self._to_result(data)
 
     def _to_result(self, data: dict) -> ExtractionResult:

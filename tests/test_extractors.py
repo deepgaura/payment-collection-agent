@@ -132,3 +132,81 @@ def test_unclear_secondary_flag_on_wrong_length_number():
 def test_valid_factor_not_flagged_unclear():
     assert not EX.extract("4321", Expecting.IDENTITY).unclear_secondary
     assert not EX.extract("400001", Expecting.IDENTITY).unclear_secondary
+
+
+# --- LLM extractor: structured-output path (offline, fake client) ---------- #
+# These prove the structured-output wiring WITHOUT hitting a real LLM: we inject
+# a fake client that returns a dict, exactly like complete_json would.
+from payment_agent.extractors.llm import LLMExtractor
+from payment_agent.extractors.schema import EXTRACTION_SCHEMA
+from payment_agent.config import Config
+
+# A complete, schema-valid extraction object (all 14 keys, value-or-null).
+_VALID_LLM_OBJECT = {
+    "account_id": "ACC1001", "full_name": None, "dob_text": None,
+    "aadhaar_last4": None, "pincode": None, "amount": None,
+    "pay_full_balance": False, "cardholder_name": None, "card_number": None,
+    "cvv": None, "expiry_month": None, "expiry_year": None,
+    "wants_to_quit": False, "confirm": None,
+}
+
+
+class _FakeClient:
+    """Stands in for LLMClient. Records the schema it was given and returns a
+    canned dict (or raises) so we can test the extractor deterministically."""
+
+    def __init__(self, to_return=None, raise_exc=None):
+        self._to_return = to_return
+        self._raise = raise_exc
+        self.received_schema = "unset"
+
+    def complete_json(self, system, user, schema=None):
+        self.received_schema = schema
+        if self._raise is not None:
+            raise self._raise
+        return dict(self._to_return)
+
+
+def test_llm_extractor_passes_schema_to_client():
+    """The extractor must hand the JSON Schema to the client (provider-level
+    enforcement), not just a bare prompt."""
+    fake = _FakeClient(to_return=_VALID_LLM_OBJECT)
+    ex = LLMExtractor(Config(), client=fake)
+    result = ex.extract("my account is acc 1001", Expecting.ACCOUNT)
+    assert fake.received_schema is EXTRACTION_SCHEMA      # schema was forwarded
+    assert result.account_id == "ACC1001"
+    assert result.source == "llm"
+
+
+def test_llm_extractor_rejects_schema_violation_and_falls_back():
+    """If the model returns a shape that violates the schema (here: extra key +
+    wrong type), the validation gate rejects it and we fall back to regex, with
+    a 'schema_invalid' note so it's observable in metrics."""
+    bad = {"account_id": 12345, "surprise_field": "nope"}  # wrong type + extra key
+    fake = _FakeClient(to_return=bad)
+    ex = LLMExtractor(Config(), client=fake)
+    result = ex.extract("my account is acc 1001", Expecting.ACCOUNT)
+    # Fell back to the deterministic regex extractor...
+    assert result.source == "rule_based"
+    assert "schema_invalid" in result.notes
+    # ...which still correctly reads the account id from the same text.
+    assert result.account_id == "ACC1001"
+
+
+def test_llm_extractor_network_failure_falls_back_as_llm_failed():
+    """A non-schema error (e.g. network) tags 'llm_failed', not 'schema_invalid'."""
+    fake = _FakeClient(raise_exc=ConnectionError("boom"))
+    ex = LLMExtractor(Config(), client=fake)
+    result = ex.extract("acc 1001", Expecting.ACCOUNT)
+    assert result.source == "rule_based"
+    assert "llm_failed" in result.notes
+    assert "schema_invalid" not in result.notes
+
+
+def test_extraction_schema_is_self_consistent():
+    """Every 'required' key must be defined in properties, and extra keys are
+    forbidden - guards against future edits drifting the schema."""
+    props = set(EXTRACTION_SCHEMA["properties"])
+    required = set(EXTRACTION_SCHEMA["required"])
+    assert required == props                        # all keys required, none missing
+    assert EXTRACTION_SCHEMA["additionalProperties"] is False

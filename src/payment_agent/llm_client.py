@@ -56,12 +56,28 @@ class LLMClient:
     # ----------------------------------------------------------------------- #
     # PUBLIC: the two things the rest of the code calls
     # ----------------------------------------------------------------------- #
-    def complete_json(self, system: str, user: str) -> dict:
+    def complete_json(self, system: str, user: str, schema: Optional[dict] = None) -> dict:
         """
         Ask the LLM and get back a PYTHON DICTIONARY (parsed from JSON).
         Used by the extractor, e.g. turning "acc 1001" into {"account_id": "ACC1001"}.
         `system` = the rulebook, `user` = the actual message to process.
+
+        If `schema` (a JSON Schema dict) is given, we ask the PROVIDER to force
+        the reply to match that exact shape - this is real "structured output":
+          - OpenAI  -> response_format = json_schema (strict): the API guarantees
+                       valid-against-schema JSON or errors out.
+          - Claude  -> a single "tool" whose input_schema IS our schema, with
+                       tool_choice forcing the model to call it; the tool's
+                       arguments are the structured object.
+        If the provider/library doesn't support it, we transparently fall back
+        to plain JSON mode (still parsed the same way). The caller ALSO validates
+        the result, so structure is never assumed from the model alone.
         """
+        if schema is not None:
+            data = self._complete_structured(system, user, schema)
+            if data is not None:
+                return data
+            # Provider couldn't do schema mode -> fall through to plain JSON.
         text = self._complete(system, user, force_json=True)
         return json.loads(text)   # turn the JSON text into a real dict
 
@@ -81,6 +97,89 @@ class LLMClient:
         if self._provider == "vertex":
             return self._complete_vertex(system, user, force_json, max_tokens)
         return self._complete_openai(system, user, force_json, max_tokens)
+
+    # ----------------------------------------------------------------------- #
+    # STRUCTURED OUTPUT: force the reply to match a JSON Schema at the PROVIDER.
+    # Returns a parsed dict on success, or None if this provider/library build
+    # can't do schema mode (so the caller falls back to plain JSON mode).
+    # ----------------------------------------------------------------------- #
+    def _complete_structured(self, system: str, user: str, schema: dict) -> Optional[dict]:
+        try:
+            if self._provider == "vertex":
+                return self._structured_vertex(system, user, schema)
+            return self._structured_openai(system, user, schema)
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            # The installed library/model doesn't support this shape of call.
+            # Not an error worth crashing on - just fall back to plain JSON.
+            logger.info(
+                "Structured-output mode unavailable (%s); using plain JSON.",
+                exc.__class__.__name__,
+            )
+            return None
+
+    def _structured_openai(self, system: str, user: str, schema: dict) -> dict:
+        # OpenAI's strict Structured Outputs: the API validates the model's
+        # output against the schema and guarantees a conforming JSON object.
+        from .extractors.schema import EXTRACTION_TOOL_NAME
+
+        resp = self._client.chat.completions.create(
+            model=self._config.llm_model,
+            temperature=self._config.llm_temperature,
+            max_tokens=400,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": EXTRACTION_TOOL_NAME,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        )
+        content = resp.choices[0].message.content or "{}"
+        return json.loads(content)
+
+    def _structured_vertex(self, system: str, user: str, schema: dict) -> dict:
+        # Anthropic's structured-output path: expose a single "tool" whose
+        # input_schema is our schema, and FORCE the model to call it. The tool's
+        # arguments (tool_use.input) are our structured object.
+        from .extractors.schema import (
+            EXTRACTION_TOOL_NAME,
+            EXTRACTION_TOOL_DESCRIPTION,
+        )
+
+        kwargs = dict(
+            model=self._config.llm_model,
+            max_tokens=400,
+            temperature=self._config.llm_temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            tools=[
+                {
+                    "name": EXTRACTION_TOOL_NAME,
+                    "description": EXTRACTION_TOOL_DESCRIPTION,
+                    "input_schema": schema,
+                }
+            ],
+            # Force the model to answer BY calling our tool (no free-form text).
+            tool_choice={"type": "tool", "name": EXTRACTION_TOOL_NAME},
+        )
+        try:
+            resp = self._client.messages.create(**kwargs)
+        except TypeError:
+            # Older client that doesn't accept `temperature` alongside tools.
+            kwargs.pop("temperature", None)
+            resp = self._client.messages.create(**kwargs)
+
+        # Find the tool_use block and return its already-parsed input dict.
+        for block in resp.content:
+            if getattr(block, "type", None) == "tool_use":
+                return dict(block.input)
+        # Model didn't call the tool (shouldn't happen with forced tool_choice).
+        raise ValueError("model did not return a tool_use block")
 
     def _complete_vertex(self, system, user, force_json, max_tokens) -> str:
         # --- How Claude wants to be called ---

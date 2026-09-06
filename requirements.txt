@@ -1,6 +1,10 @@
 # Core runtime dependencies
 requests>=2.31.0
 python-dotenv>=1.0.0
+# Validates the LLM's structured output against our JSON Schema (final gate in
+# extractors/llm.py). Optional at runtime - if absent, we fall back to the
+# strict type-coercion safety net - but recommended for full enforcement.
+jsonschema>=4.0.0
 
 # Optional: enables the LLM-backed extractor + conversational phrasing. The
 # agent runs fully without these using the deterministic rule-based extractor.
