@@ -1,18 +1,28 @@
-"""Optional LLM-based persona simulator.
+"""
+WHAT THIS FILE IS (in one line):
+    A robot-vs-robot test: an LLM PRETENDS to be a user and chats with our agent.
 
-The assignment says evaluation is done by "an LLM-based evaluator ... simulating
-different user personas". This module mirrors that: an LLM role-plays a user
-with a goal and a personality (terse, chatty, types digits with spaces, etc.),
-talking to our Agent in a loop until the conversation closes. It is a
-complement to the deterministic scenario harness, not a replacement - it is
-non-deterministic, so it is opt-in and requires an API key.
+WHY:
+    The assignment says they'll evaluate using "an LLM-based evaluator simulating
+    different user personas". This mirrors that. Each "persona" has a goal and a
+    personality (terse, chatty, or an impostor). The simulator LLM plays that
+    person, message by message, until the chat ends.
 
-Correctness for a persona run is judged structurally (did a legitimate persona
-reach a paid state? did an impostor persona fail verification and never pay?),
-which does not depend on exact wording.
+HOW WE SCORE IT:
+    We don't check exact words (an LLM's wording varies). We check the OUTCOME:
+      - a legitimate persona should end up PAID
+      - an impostor should NEVER verify and NEVER pay
+    If the outcome matches what we expected, that persona "passed".
+
+NOTE / HONESTY:
+    - This is a COMPLEMENT to run_eval.py, not a replacement. It's
+      non-deterministic (real LLM calls) and slower, so it's opt-in.
+    - Two LLMs are involved: the *simulator* here uses OpenAI (needs
+      OPENAI_API_KEY), and the *agent* uses whatever provider is configured
+      (Claude/Vertex by default). So a full run may need both set up.
 
 Usage:
-    OPENAI_API_KEY=... python -m eval.personas
+    python -m eval.personas
 """
 
 from __future__ import annotations
@@ -27,6 +37,8 @@ from payment_agent.config import Config  # noqa: E402
 from payment_agent.state import Step  # noqa: E402
 
 
+# The list of make-believe users. Each has a `goal` (given to the simulator LLM
+# as its character brief) and `expect_paid` (what the correct outcome should be).
 PERSONAS = [
     {
         "name": "legit_terse",
@@ -51,6 +63,8 @@ PERSONAS = [
     },
 ]
 
+# The instructions we give the SIMULATOR LLM so it acts like a real, messy human
+# (one short message at a time), and says "[END]" when the chat is clearly done.
 SIM_SYSTEM = """\
 You are role-playing a USER talking to a payment-collection agent. Stay in
 character per your goal. Send ONE short, natural, human-sounding message per
@@ -61,36 +75,45 @@ is clearly finished, reply with exactly "[END]".
 
 
 def _simulate(persona: dict, max_turns: int = 20) -> dict:
+    """Run ONE persona: let the simulator LLM chat with our agent until the chat
+    ends, then report whether the outcome matched what we expected."""
     from openai import OpenAI
 
-    client = OpenAI()
-    agent = Agent(Config(use_llm=True))
+    client = OpenAI()                    # the simulator (the fake "user")
+    agent = Agent(Config(use_llm=True))  # our real agent
     transcript: list[tuple[str, str]] = []
 
-    # Agent greets first.
+    # Our agent greets first.
     agent_msg = agent.next("")["message"]
     transcript.append(("agent", agent_msg))
 
+    # The simulator's running memory: its character brief + the chat so far.
     history = [
         {"role": "system", "content": SIM_SYSTEM},
         {"role": "user", "content": f"Your goal: {persona['goal']}"},
     ]
 
+    # Back-and-forth loop (bounded by max_turns so it can't run forever).
     for _ in range(max_turns):
+        # 1) Tell the simulator what the agent just said, and get its reply.
         history.append({"role": "user", "content": f"Agent said: {agent_msg}"})
         resp = client.chat.completions.create(
             model="gpt-4o-mini", temperature=0.7, messages=history,
         )
         user_msg = (resp.choices[0].message.content or "").strip()
         history.append({"role": "assistant", "content": user_msg})
+        # 2) If the simulator signalled the end, stop.
         if "[END]" in user_msg:
             break
         transcript.append(("user", user_msg))
+        # 3) Feed the simulated user's message to our real agent.
         agent_msg = agent.next(user_msg)["message"]
         transcript.append(("agent", agent_msg))
+        # 4) If the agent closed the session (paid or gave up), stop.
         if agent.step in (Step.CLOSED_SUCCESS, Step.CLOSED_FAILURE):
             break
 
+    # Did the agent end in a "paid" state? Compare to what we expected.
     paid = agent.step == Step.CLOSED_SUCCESS
     return {
         "persona": persona["name"],
@@ -104,6 +127,7 @@ def _simulate(persona: dict, max_turns: int = 20) -> dict:
 
 
 def main() -> int:
+    # Run every persona and print a little scorecard (OK/XX per persona).
     results = [_simulate(p) for p in PERSONAS]
     correct = sum(1 for r in results if r["correct"])
     for r in results:

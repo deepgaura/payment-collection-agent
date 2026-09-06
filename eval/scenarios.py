@@ -1,23 +1,27 @@
-"""Scripted evaluation scenarios.
+"""
+WHAT THIS FILE IS (in one line):
+    The list of scripted test conversations + the little "check" functions that
+    say what SHOULD happen at each step. run_eval.py plays these.
 
-Each scenario is a deterministic sequence of user turns plus assertions about
-the agent's behaviour. Assertions are expressed as small, composable checks so
-the harness can report per-turn and per-scenario correctness, not just a single
-pass/fail.
+THE SHAPE OF A SCENARIO:
+    A Scenario = a name, a category, and a list of Turns.
+    A Turn     = one user message + a list of checks to run on the agent's reply.
+    A check    = a tiny function that returns (passed?, description).
+    So a scenario reads almost like a chat transcript with assertions attached.
 
-We define "correct" concretely per step:
-  - greeting: agent asks for the account id.
-  - account lookup: correct account is fetched (tool call correctness).
-  - verification: agent verifies ONLY when the strict rule is satisfied, and
-    counts retries; it never leaks stored account data.
-  - amount: the parsed amount matches intent and respects the balance.
-  - payment: the API is called with a correctly-built payload at the right
-    time, and the outcome is communicated (txn id on success, reason on fail).
-  - closure: terminal state reached appropriately.
+WHAT "CORRECT" MEANS (checked here):
+    - greeting     -> agent asks for the account id
+    - lookup       -> the right account is fetched (a tool-call check)
+    - verification -> passes ONLY when the strict rule holds; never leaks data
+    - amount       -> matches what the user meant and respects the balance
+    - payment      -> API called with the right data at the right time, and the
+                      outcome is stated (txn id on success, reason on failure);
+                      and NOT called when it shouldn't be (negative checks)
+    - closure      -> the conversation ends in the right final state
 
-Checks operate on the message text and on the agent's observable state
-(`agent.step`, `agent.is_verified`, `agent.transaction_id`) plus the mock API's
-recorded calls, so we verify tool usage, not just wording.
+    Checks look at both the agent's WORDS and its observable state
+    (agent.step / is_verified / transaction_id) and the fake API's recorded
+    calls - so we verify real behaviour, not just phrasing.
 """
 
 from __future__ import annotations
@@ -25,17 +29,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-# A check receives (message, agent, api) and returns (passed, label).
+# A "check" is a function: given (agent's message, agent, api) it returns
+# (did it pass?, a short description). Everything below builds these.
 Check = Callable[[str, object, object], tuple[bool, str]]
 
 
-# --- forced-failure API clients (for payment-failure scenarios) ------------ #
+# --- a fake API that always fails payment (for payment-failure scenarios) --- #
 def _forced_error_client(error_code: str, status: int = 422):
-    """Build a mock API client whose process-payment always returns `error_code`.
-
-    Lets a scenario deterministically exercise a server-side failure path (e.g.
-    insufficient_balance, invalid_amount) even when the input would pass our
-    local validation. Lookup behaves normally.
+    """
+    Make a fake API whose process_payment ALWAYS returns the given error.
+    Handy for testing server-side failures like "insufficient_balance" that our
+    local checks would otherwise let through. (Lookup still works normally.)
     """
     from tests.fixtures import MockApiClient
     from payment_agent.tools.payment_api import ApiResult
@@ -50,31 +54,36 @@ def _forced_error_client(error_code: str, status: int = 422):
 
 @dataclass
 class Turn:
+    """One user message, plus the checks to run on the agent's reply to it."""
     user: str
     checks: list[Check] = field(default_factory=list)
 
 
 @dataclass
 class Scenario:
+    """One full scripted conversation to test."""
     name: str
-    category: str  # happy | verification_failure | payment_failure | edge_case
+    category: str  # one of: happy | verification_failure | payment_failure | edge_case
     turns: list[Turn]
-    # Final-state checks run after all turns.
+    # Checks to run AFTER all turns (e.g. "did we end in closed_success?").
     final_checks: list[Check] = field(default_factory=list)
-    # Optional: a callable returning a custom (offline) API client. Used by
-    # payment-failure scenarios to force a specific server error deterministically.
+    # Optional: bring a custom fake API (e.g. one that forces a server error).
     api_factory: object = None
 
 
-# --- reusable check builders ----------------------------------------------- #
+# --- the little check-builder functions ------------------------------------ #
+# Each returns a `check` function. We call them when building scenarios, e.g.
+# msg_contains("card") makes a check that passes if the reply mentions "card".
+
 def _tool_check(fn):
-    """Tag a check as a tool-call-correctness check so the harness can report
-    it as its own metric (the doc names 'correctness of tool calls')."""
+    """Mark a check as a 'tool-call correctness' check, so the report can count
+    those separately (the assignment names this as a metric)."""
     fn.is_tool_check = True
     return fn
 
 
 def msg_contains(*substrings: str) -> Check:
+    # Passes if the agent's reply contains ALL of these words/phrases (case-insensitive).
     def check(message: str, agent, api) -> tuple[bool, str]:
         low = message.lower()
         ok = all(s.lower() in low for s in substrings)
@@ -83,6 +92,7 @@ def msg_contains(*substrings: str) -> Check:
 
 
 def msg_excludes(*substrings: str) -> Check:
+    # Passes if the reply contains NONE of these (e.g. no leaked data).
     def check(message: str, agent, api) -> tuple[bool, str]:
         ok = all(s.lower() not in message.lower() for s in substrings)
         return ok, f"message excludes {substrings!r}"
@@ -90,18 +100,21 @@ def msg_excludes(*substrings: str) -> Check:
 
 
 def step_is(step_value: str) -> Check:
+    # Passes if the agent is on this step (e.g. "closed_success").
     def check(message: str, agent, api) -> tuple[bool, str]:
         return agent.step.value == step_value, f"step == {step_value}"
     return check
 
 
 def verified(expected: bool) -> Check:
+    # Passes if the agent's verified flag matches what we expect (True/False).
     def check(message: str, agent, api) -> tuple[bool, str]:
         return agent.is_verified == expected, f"is_verified == {expected}"
     return check
 
 
 def has_transaction() -> Check:
+    # Passes if a real transaction id was produced (i.e. a payment went through).
     def check(message: str, agent, api) -> tuple[bool, str]:
         tid = agent.transaction_id
         return bool(tid and tid.startswith("txn_")), "transaction id present"
@@ -109,10 +122,11 @@ def has_transaction() -> Check:
 
 
 def payment_calls(n: int) -> Check:
+    # Tool-call check: passes if the payment API was called exactly n times.
     @_tool_check
     def check(message: str, agent, api) -> tuple[bool, str]:
-        # Only meaningful against the mock API which records calls. In live
-        # mode there is nothing to inspect, so treat as satisfied (skipped).
+        # Only the fake API records calls. In --live mode there's nothing to
+        # inspect, so we skip (count as passed).
         if not hasattr(api, "payment_calls"):
             return True, f"payment API called {n}x (skipped: live)"
         return len(api.payment_calls) == n, f"payment API called {n}x"
@@ -120,6 +134,7 @@ def payment_calls(n: int) -> Check:
 
 
 def last_payment_amount(amount: float) -> Check:
+    # Tool-call check: passes if the most recent charge was for this amount.
     @_tool_check
     def check(message: str, agent, api) -> tuple[bool, str]:
         if not hasattr(api, "payment_calls"):
@@ -131,7 +146,7 @@ def last_payment_amount(amount: float) -> Check:
 
 
 def lookup_calls(n: int) -> Check:
-    """Assert the lookup API was called exactly n times (tool-call correctness)."""
+    # Tool-call check: passes if the lookup API was called exactly n times.
     @_tool_check
     def check(message: str, agent, api) -> tuple[bool, str]:
         if not hasattr(api, "lookup_calls"):
@@ -141,8 +156,8 @@ def lookup_calls(n: int) -> Check:
 
 
 def never_charged() -> Check:
-    """Negative tool-call assertion: the payment API must NOT have been called.
-    Used to prove no charge happens before verification or on invalid input."""
+    # NEGATIVE tool-call check: passes if the payment API was NEVER called.
+    # Proves we don't charge before verification, or on invalid input.
     @_tool_check
     def check(message: str, agent, api) -> tuple[bool, str]:
         if not hasattr(api, "payment_calls"):
@@ -152,7 +167,7 @@ def never_charged() -> Check:
 
 
 def no_sensitive_leak() -> Check:
-    """Stored secrets for the sample accounts must never appear in output."""
+    # Security check: none of the stored secret values should appear in a reply.
     SECRETS = ["4321", "400001", "9876", "400002", "2468", "1357", "400004"]
     def check(message: str, agent, api) -> tuple[bool, str]:
         ok = all(s not in message for s in SECRETS)
@@ -160,7 +175,9 @@ def no_sensitive_leak() -> Check:
     return check
 
 
-# --- the scenario catalogue ------------------------------------------------- #
+# --- the list of all test conversations ------------------------------------ #
+# Each Scenario below reads like a chat script with checks attached. The comment
+# above each one says what it's testing. run_eval.py plays them all.
 def all_scenarios() -> list[Scenario]:
     return [
         # 1) Happy path with messy, natural-language inputs across every field.

@@ -1,21 +1,29 @@
-"""Evaluation harness.
+"""
+WHAT THIS FILE IS (in one line):
+    The test-runner for the whole agent. It plays scripted conversations and
+    prints a scorecard.
 
-Runs every scenario in `scenarios.py` against a fresh Agent (wired to the
-deterministic mock API so results are reproducible and free) and reports:
+HOW IT WORKS:
+    - scenarios.py has a list of scripted chats (each = a list of user messages
+      plus "checks" that say what SHOULD happen).
+    - This file runs each scenario against a fresh Agent, ticks off the checks,
+      and prints a report: which scenarios passed, and some scores.
 
-  - per-scenario pass/fail with the first failing check
-  - per-category success rate
-  - overall check-level accuracy (fraction of individual assertions passed)
-  - tool-call correctness (were lookups/payments made correctly and only when
-    appropriate)
+WHAT IT REPORTS:
+    - per-scenario PASS/FAIL
+    - success rate per category (happy / verification_failure / payment_failure / edge)
+    - check-level accuracy (fraction of ALL individual checks that passed)
+    - tool-call correctness (were the lookup/payment APIs called correctly and
+      only when they should be)
 
-Usage:
-    python -m eval.run_eval            # offline, deterministic (recommended)
-    python -m eval.run_eval --live     # run against the real API
-    python -m eval.run_eval --llm      # use the LLM extractor (needs API key)
+HOW TO RUN:
+    python -m eval.run_eval            # normal: offline + a fake API (fast, repeatable)
+    python -m eval.run_eval --live     # use the REAL payment API
+    python -m eval.run_eval --llm      # use the LLM translator (needs a key)
+    add --verbose                      # also print which checks failed
 
-The offline mode is the canonical evaluation: it is deterministic and asserts
-tool-call correctness precisely via the mock's recorded calls.
+    "Offline" mode is the main one - it's repeatable and can check tool calls
+    exactly (because the fake API records every call).
 """
 
 from __future__ import annotations
@@ -36,27 +44,33 @@ from .scenarios import Scenario, all_scenarios  # noqa: E402
 
 @dataclass
 class ScenarioResult:
+    """The scorecard for ONE scenario after we run it."""
     name: str
     category: str
-    passed: bool
-    total_checks: int
-    passed_checks: int
-    failures: list[str]
-    tool_total: int = 0     # tool-call-correctness checks in this scenario
-    tool_passed: int = 0
+    passed: bool             # did ALL checks in this scenario pass?
+    total_checks: int        # how many checks it had
+    passed_checks: int       # how many passed
+    failures: list[str]      # descriptions of the ones that failed
+    tool_total: int = 0      # how many of the checks were tool-call checks
+    tool_passed: int = 0     # how many of those passed
 
 
 def _build_agent(scenario, live: bool, use_llm: bool):
-    """Return (agent, api) for one scenario run."""
+    """
+    Set up a fresh Agent for one scenario, wired the way this run wants:
+      live=True  -> talk to the REAL API
+      live=False -> use a FAKE API (records calls so we can check tool usage)
+    Returns (agent, api) - we return the api too so checks can inspect it.
+    """
     config = Config(use_llm=use_llm)
     if live:
         agent = Agent(config)
-        return agent, agent._api  # real client; payment_calls not tracked
-    # Offline: mock API + deterministic rule-based extractor unless --llm.
+        return agent, agent._api  # real client; it doesn't record calls
+    # Offline: use the fake API + the regex translator (unless --llm was passed).
     from tests.fixtures import MockApiClient
     from payment_agent.extractors.rule_based import RuleBasedExtractor
 
-    # A scenario may supply a custom API client (e.g. to force a server error).
+    # Some scenarios bring their own fake API (e.g. to force "insufficient balance").
     api = scenario.api_factory() if scenario.api_factory else MockApiClient()
     extractor = None if use_llm else RuleBasedExtractor()
     agent = Agent(config, api_client=api, extractor=extractor)
@@ -64,16 +78,18 @@ def _build_agent(scenario, live: bool, use_llm: bool):
 
 
 def run_scenario(scenario: Scenario, *, live: bool, use_llm: bool) -> ScenarioResult:
+    """Play one scripted chat and tick off every check, returning its scorecard."""
     agent, api = _build_agent(scenario, live, use_llm)
     total = passed = 0
     tool_total = tool_passed = 0
     failures: list[str] = []
 
+    # Small helper: run one check and update the tallies.
     def record(check, message, where):
         nonlocal total, passed, tool_total, tool_passed
-        ok, label = check(message, agent, api)
+        ok, label = check(message, agent, api)     # each check returns (passed?, label)
         total += 1
-        is_tool = getattr(check, "is_tool_check", False)
+        is_tool = getattr(check, "is_tool_check", False)   # is it a tool-call check?
         if is_tool:
             tool_total += 1
         if ok:
@@ -83,17 +99,19 @@ def run_scenario(scenario: Scenario, *, live: bool, use_llm: bool) -> ScenarioRe
         else:
             failures.append(f"{where}: FAILED {label} | got: {message!r}")
 
+    # Play each user turn, then run that turn's checks against the agent's reply.
     for i, turn in enumerate(scenario.turns):
         message = agent.next(turn.user)["message"]
         for check in turn.checks:
             record(check, message, f"turn {i} ({turn.user!r})")
 
+    # Finally, run the "end-of-conversation" checks (e.g. "did we end paid?").
     for check in scenario.final_checks:
         record(check, "", "final")
 
     return ScenarioResult(
         name=scenario.name, category=scenario.category,
-        passed=(passed == total), total_checks=total,
+        passed=(passed == total), total_checks=total,   # scenario passes only if EVERY check did
         passed_checks=passed, failures=failures,
         tool_total=tool_total, tool_passed=tool_passed,
     )
@@ -106,6 +124,7 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+    # Read the command-line flags (--live / --llm / --verbose).
     parser = argparse.ArgumentParser(description="Payment agent evaluation harness")
     parser.add_argument("--live", action="store_true", help="run against the real API")
     parser.add_argument("--llm", action="store_true", help="use the LLM extractor")
@@ -116,9 +135,11 @@ def main() -> int:
         print("NOTE: --live cannot assert tool-call counts (no mock). "
               "Behavioural checks still run.\n")
 
+    # Run every scenario and collect its scorecard.
     results = [run_scenario(s, live=args.live, use_llm=args.llm) for s in all_scenarios()]
 
-    # --- report ---
+    # --- print the report ---
+    # Group scenarios by category so we can show a per-category success rate.
     by_category: dict[str, list[ScenarioResult]] = defaultdict(list)
     for r in results:
         by_category[r.category].append(r)
