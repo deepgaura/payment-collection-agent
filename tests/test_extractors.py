@@ -26,11 +26,25 @@ def test_account_id_variants(text):
 @pytest.mark.parametrize("text,expected", [
     ("my name is Nithin Jain", "Nithin Jain"),
     ("Nithin Jain", "Nithin Jain"),
+    ("it's Nithin, Nithin Jain", "Nithin Jain"),       # restated after a comma
     ("you can call me Raja but my full name is Rajarajeswari Balasubramaniam",
      "Rajarajeswari Balasubramaniam"),
 ])
 def test_name_variants(text, expected):
     assert EX.extract(text, Expecting.IDENTITY).full_name == expected
+
+
+@pytest.mark.parametrize("chatter", [
+    "how are you doing",     # lowercase -> not a name
+    "tell me a joke",        # lowercase chatter
+    "pay 500 now",           # has digits / lowercase
+    "yes please",            # affirmation, not a name
+])
+def test_bare_chatter_is_not_a_name(chatter):
+    # The fallback accepts a bare name only if it's Proper-Case words (a
+    # positive signal that generalises), so lowercase chatter is rejected
+    # WITHOUT needing a hand-maintained blocklist of filler words.
+    assert EX.extract(chatter, Expecting.IDENTITY).full_name is None
 
 
 # --- Date of birth (raw text captured, parsed downstream) ------------------ #

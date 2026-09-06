@@ -36,19 +36,6 @@ from .base import Expecting, ExtractionResult
 # Words that mean "I want to stop". If any appear, we flag wants_to_quit.
 _QUIT_WORDS = re.compile(r"\b(quit|exit|cancel|stop|nevermind|never mind|bye|goodbye)\b", re.I)
 
-# Common conversational filler / function words that should never appear inside
-# a bare name. If any token is one of these, the phrase is treated as chatter,
-# not a name. Kept small and high-precision on purpose.
-_NAME_STOPWORDS = {
-    "tell", "me", "a", "an", "the", "joke", "hmm", "ok", "okay", "yes", "no",
-    "what", "when", "where", "why", "how", "who", "you", "your", "need", "again",
-    "please", "hi", "hello", "hey", "thanks", "thank", "do", "does", "is", "are",
-    "am", "was", "were", "will", "can", "could", "would", "should", "help",
-    "want", "know", "dunno", "sure", "maybe", "and", "or", "but", "of", "to",
-    "for", "with", "give", "get", "let", "us", "it", "this", "that", "here",
-    "there", "now", "then", "pay", "paid", "not",
-}
-
 # Spoken single digits -> numbers. Used to read "one two three" as 1,2,3.
 _NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
@@ -225,34 +212,35 @@ class RuleBasedExtractor:
 
     @staticmethod
     def _name(text: str) -> Optional[str]:
-        # Try to pull out a person's name, in order of confidence:
+        # This is the DETERMINISTIC FALLBACK, so it only aims to catch the clear,
+        # common shapes. Anything trickier is the LLM extractor's job. Two rules:
         #
-        # 1) "full name is X"  -> best; wins even over a nickname.
-        #    ("call me Raja but my full name is Rajarajeswari" -> Rajarajeswari)
+        # 1) An explicit cue: "full name is X" / "my name is X" / "i'm X" / "it's X".
+        #    "full name is" is checked first so it wins over a nickname
+        #    ("call me Raja but my full name is Rajarajeswari" -> Rajarajeswari).
         m = re.search(r"full name is\s+([A-Za-z][A-Za-z .'-]+)", text, re.I)
         if m:
             return _clean_name(m.group(1))
-        # 2) "my name is X" / "i'm X" / "it's X".
-        m = re.search(r"\b(?:my name is|name is|i am|i'm|this is|it's)\s+([A-Za-z][A-Za-z .'-]+)", text, re.I)
+        m = re.search(
+            r"\b(?:my name is|name is|i am|i'm|this is|it's)\s+([A-Za-z][A-Za-z .'-]+)",
+            text, re.I,
+        )
         if m:
-            candidate = _clean_name(m.group(1))
-            # Special case: "it's Nithin, Nithin Jain" -> take the fuller name
-            # after the comma.
+            # If they restate it after a comma ("it's Nithin, Nithin Jain"),
+            # prefer the fuller version after the comma.
             tail = re.search(r",\s*([A-Za-z][A-Za-z .'-]+)$", text.strip())
-            if tail:
-                return _clean_name(tail.group(1))
-            return candidate
-        # 3) Bare name: they just typed "Nithin Jain" with no cue words.
-        #    We only accept it if it's 2-5 words, all letters, and contains none
-        #    of the filler/stopwords - so "tell me a joke" is NOT taken as a
-        #    name. (This is a rough rule; the LLM handles the trickier cases.)
+            return _clean_name(tail.group(1) if tail else m.group(1))
+
+        # 2) A bare name with NO cue words. Instead of a blocklist of filler
+        #    words (which can never be complete), we use one positive signal
+        #    that generalises: a name looks like Proper-Case words.
+        #    "Nithin Jain" / "Rahul Mehta" -> accepted;
+        #    "how are you" / "pay 500 now" -> rejected (not Proper-Case).
         stripped = text.strip().strip(".")
         tokens = stripped.split()
         if (
-            2 <= len(tokens) <= 5
-            and re.fullmatch(r"[A-Za-z][A-Za-z .'-]+", stripped)
-            and not re.search(r"\b(dob|born|aadhaar|pin|account|acc|cvv|card)\b", stripped, re.I)
-            and not any(tok.lower() in _NAME_STOPWORDS for tok in tokens)
+            2 <= len(tokens) <= 4
+            and all(re.fullmatch(r"[A-Z][a-z'.-]+", tok) for tok in tokens)
         ):
             return _clean_name(stripped)
         return None
