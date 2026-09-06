@@ -102,18 +102,59 @@ class Config:
     # jumps); only the exact wording of extraction can vary, which never changes
     # whether verification or payment succeeds.
     use_llm: bool = field(default_factory=lambda: _env_bool("USE_LLM", True))
+
+    # Provider selects the backend: "vertex" (Anthropic Claude on Google Vertex)
+    # or "openai". Auto-detects: if Vertex env vars are present, default to
+    # vertex; else openai. Both go through one small client abstraction.
+    llm_provider: str = field(
+        default_factory=lambda: os.environ.get(
+            "LLM_PROVIDER",
+            "vertex" if os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") else "openai",
+        ).lower()
+    )
     llm_model: str = field(
-        default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        default_factory=lambda: os.environ.get(
+            "LLM_MODEL",
+            os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-5@20251101")
+            if os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+            else "gpt-4o-mini",
+        )
     )
     llm_api_key: str | None = field(
         default_factory=lambda: os.environ.get("OPENAI_API_KEY")
     )
+    # --- Vertex (Anthropic) settings ---
+    vertex_project_id: str | None = field(
+        default_factory=lambda: os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+    )
+    vertex_region: str = field(
+        default_factory=lambda: os.environ.get("CLOUD_ML_REGION", "europe-west1")
+    )
     llm_timeout_seconds: float = field(
-        default_factory=lambda: float(os.environ.get("LLM_TIMEOUT", "15"))
+        default_factory=lambda: float(os.environ.get("LLM_TIMEOUT", "20"))
     )
     # Temperature 0 => as deterministic as the model allows. We want stable
     # extraction, not creativity.
     llm_temperature: float = 0.0
+
+    # --- Conversational phrasing layer ---
+    # When on, an LLM lightly *rephrases* the deterministically-chosen reply to
+    # sound natural (acknowledge small talk, warmer prompts). It NEVER decides
+    # anything and is only allowed on safe, non-transactional steps; sensitive
+    # messages (balance, transaction id, errors) always use the exact
+    # deterministic template. Falls back to the template on any error.
+    use_conversational: bool = field(
+        default_factory=lambda: _env_bool("USE_CONVERSATIONAL", True)
+    )
+
+    @property
+    def llm_available(self) -> bool:
+        """True if an LLM backend is usable given current config."""
+        if not self.use_llm:
+            return False
+        if self.llm_provider == "vertex":
+            return bool(self.vertex_project_id)
+        return bool(self.llm_api_key)
 
 
 # A module-level default that most callers can share.

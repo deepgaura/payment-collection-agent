@@ -23,7 +23,7 @@ def build_extractor(config=None):
 
     config = config or DEFAULT_CONFIG
     fallback = RuleBasedExtractor()
-    if not config.use_llm or not config.llm_api_key:
+    if not config.llm_available:
         return fallback
     try:
         from .llm import LLMExtractor

@@ -6,12 +6,29 @@ import pytest
 
 from payment_agent.validators import (
     luhn_ok,
+    normalize_account_id,
     parse_date_strict,
     validate_amount,
     validate_card_number,
     validate_cvv,
     validate_expiry,
 )
+
+
+# --- Account ID shape (must be exact; never repaired) ---------------------- #
+@pytest.mark.parametrize("raw,expected", [
+    ("ACC1001", "ACC1001"),
+    ("acc 1001", "ACC1001"),   # case/space normalised only
+    ("  ACC1001 ", "ACC1001"),
+    ("AC1001", None),          # one C -> NOT repaired, rejected
+    ("A1001", None),
+    ("1001", None),
+    ("ACCABC", None),
+    ("ACC1001x", None),
+    (None, None),
+])
+def test_normalize_account_id(raw, expected):
+    assert normalize_account_id(raw) == expected
 
 
 # --- Luhn / card number ---------------------------------------------------- #

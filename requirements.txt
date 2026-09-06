@@ -2,7 +2,8 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 
-# Optional: enables the LLM-backed extractor. The agent runs fully without this
-# using the deterministic rule-based extractor (the default), so this is only
-# needed if you opt into the LLM path with USE_LLM=true.
-openai>=1.30.0
+# Optional: enables the LLM-backed extractor + conversational phrasing. The
+# agent runs fully without these using the deterministic rule-based extractor.
+# Install the one matching your provider (LLM_PROVIDER):
+anthropic[vertex]>=0.40.0   # provider = vertex (Claude on Google Vertex)
+openai>=1.30.0              # provider = openai

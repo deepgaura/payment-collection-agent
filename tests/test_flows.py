@@ -43,9 +43,10 @@ def test_happy_path_success():
         "born 14th May 1990",
         "pay a thousand rupees",
     ])
-    final = agent.next(
+    agent.next(
         "card 4532 0151 1283 0366 expires December 2027 cvv one two three name Nithin Jain"
-    )["message"]
+    )
+    final = agent.next("yes")["message"]  # confirm before charging
     assert agent.step == Step.CLOSED_SUCCESS
     assert agent.is_verified
     assert "recap" in final.lower() and "transaction id" in final.lower()
@@ -59,6 +60,7 @@ def test_full_balance_payment():
     agent = make_agent(api)
     run(agent, ["ACC1002", "Rajarajeswari Balasubramaniam", "aadhaar 9876", "clear the full amount"])
     agent.next("card 4532 0151 1283 0366 exp 12/2027 cvv 123 name Raja")
+    agent.next("yes")
     assert agent.step == Step.CLOSED_SUCCESS
     assert api.payment_calls[0]["amount"] == 540.00
 
@@ -138,6 +140,7 @@ def test_insufficient_balance_then_retry():
     # valid smaller amount succeeds.
     run(agent, ["pay 500"])
     agent.next("card 4532 0151 1283 0366 exp 12/2027 cvv 123 name Raja")
+    agent.next("yes")
     assert agent.step == Step.CLOSED_SUCCESS
 
 
@@ -237,8 +240,9 @@ def test_cvv_not_retained_after_attempt():
 
     agent = make_agent(OneInsufficient())
     run(agent, ["ACC1001", "Nithin Jain", "dob 1990-05-14", "pay 500"])
-    agent.next("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain")  # -> insufficient
-    # Card number kept for convenience, but CVV dropped.
+    agent.next("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain")
+    agent.next("yes")  # confirm -> attempt -> server says insufficient
+    # Card number kept for convenience, but CVV dropped after the attempt.
     assert agent._state.card.card_number is not None
     assert agent._state.card.cvv is None
     agent.next("pay 300")
@@ -258,7 +262,8 @@ def test_success_without_transaction_id_not_treated_as_success():
 
     agent = make_agent(NoTxnApi())
     run(agent, ["ACC1001", "Nithin Jain", "dob 1990-05-14", "pay 500"])
-    msg = agent.next("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain")["message"]
+    agent.next("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain")
+    msg = agent.next("yes")["message"]
     assert "None" not in msg
     assert agent.step != Step.CLOSED_SUCCESS
     assert agent.transaction_id is None
@@ -278,6 +283,22 @@ def test_no_progress_closes_gracefully():
     assert not agent.is_verified
 
 
+def test_irrelevant_data_does_not_reset_no_progress():
+    """Progress is step-aware: volunteering a name while we're still asking for
+    the account must NOT reset the no-progress counter (a stuck/hostile user
+    can't drag the session out by dripping parseable-but-irrelevant tokens)."""
+    agent = make_agent()
+    # Never provide an account id; one turn gives an (irrelevant here) name.
+    msgs = ["hey how are you", "my name is deepanshu mahajan",
+            "i dont like you", "i dont like you", "i dont like you", "i dont like you"]
+    for m in msgs:
+        agent.next(m)
+        if agent.step == Step.CLOSED_FAILURE:
+            break
+    assert agent.step == Step.CLOSED_FAILURE
+    assert not agent.is_verified
+
+
 def test_slow_but_progressing_user_not_closed():
     """A user who progresses (with chatter in between) must not be cut off by
     the no-progress guard."""
@@ -286,12 +307,49 @@ def test_slow_but_progressing_user_not_closed():
     assert agent.is_verified  # reached verification despite a filler turn
 
 
+def test_phraser_never_touches_sensitive_messages():
+    """The conversational phraser may reword safe prompts, but sensitive /
+    transactional messages (balance, transaction id, recap) must pass through
+    as the exact deterministic template - never sent to the LLM."""
+    from payment_agent.phraser import Phraser
+
+    class MangleClient:
+        """A fake LLM that would corrupt any message it's asked to rephrase."""
+        def complete_text(self, system, user, max_tokens=160):
+            return "CORRUPTED BY LLM"
+
+    agent = make_agent()
+    agent._phraser = Phraser(MangleClient(), metrics=agent.metrics)
+
+    # Safe prompt (asking for name) -> allowed to be rephrased.
+    agent.next("ACC1001")
+    safe_msg = agent.next("hi there")["message"]  # clarify/ask -> rephrasable
+    assert safe_msg == "CORRUPTED BY LLM"
+
+    # Reach the balance reveal (sensitive) -> must be the real template.
+    agent.next("Nithin Jain")
+    balance_msg = agent.next("dob 1990-05-14")["message"]
+    assert "1,250.75" in balance_msg          # real balance present
+    assert "CORRUPTED" not in balance_msg     # LLM did NOT touch it
+
+    # The confirmation summary (amount + card last4) is sensitive -> template.
+    agent.next("pay 500")
+    summary = agent.next("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain")["message"]
+    assert "500.00" in summary and "0366" in summary
+    assert "CORRUPTED" not in summary
+
+    # Complete payment -> the recap (transaction id) must be the real template.
+    recap = agent.next("yes")["message"]
+    assert "Transaction ID" in recap
+    assert "CORRUPTED" not in recap
+
+
 def test_metrics_recorded_over_a_conversation():
     """The agent records observability signals: turn count, latency timers, and
     business outcomes (verification/payment)."""
     agent = make_agent()
     run(agent, ["ACC1001", "Nithin Jain", "dob 1990-05-14", "pay 500",
-                "4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain"])
+                "4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain", "yes"])
     assert agent.step == Step.CLOSED_SUCCESS
     snap = agent.metrics.snapshot()
     # Turn count and a turn-latency timer exist.
@@ -300,6 +358,18 @@ def test_metrics_recorded_over_a_conversation():
     # Business outcomes were counted.
     assert snap["counters"].get("verification.success") == 1
     assert snap["counters"].get("payment.success") == 1
+
+
+def test_malformed_account_id_rejected_not_repaired():
+    """A malformed account id (e.g. 'AC1001', one C) must be rejected and NOT
+    silently repaired into a valid-but-different account. The agent stays on the
+    account step and never looks anyone up."""
+    api = MockApiClient()
+    agent = make_agent(api)
+    msg = agent.next("AC1001")["message"]
+    assert agent.step == Step.AWAIT_ACCOUNT      # did not advance
+    assert len(api.lookup_calls) == 0            # never looked up an account
+    assert "account id" in msg.lower()           # re-asked
 
 
 def test_malformed_lookup_response_does_not_crash():
@@ -339,6 +409,7 @@ def test_terminal_session_stays_closed():
     agent = make_agent(api)
     run(agent, ["ACC1001", "Nithin Jain", "dob 1990-05-14", "pay 500"])
     agent.next("card 4532 0151 1283 0366 exp 12/2027 cvv 123 name Nithin Jain")
+    agent.next("yes")
     assert agent.step == Step.CLOSED_SUCCESS
     after = agent.next("hello again")["message"]
     assert "ended" in after.lower() or "complete" in after.lower() or "new conversation" in after.lower()

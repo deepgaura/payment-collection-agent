@@ -100,6 +100,12 @@ def run_scenario(scenario: Scenario, *, live: bool, use_llm: bool) -> ScenarioRe
 
 
 def main() -> int:
+    # Windows consoles default to cp1252 and choke on the rupee sign in verbose
+    # failure output; force UTF-8 so the report always prints.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Payment agent evaluation harness")
     parser.add_argument("--live", action="store_true", help="run against the real API")
     parser.add_argument("--llm", action="store_true", help="use the LLM extractor")

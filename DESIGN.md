@@ -32,10 +32,16 @@ LLM primary    owns every decision:     lookup-account
 Components:
 - **`Agent`** — implements the required `next()` interface; owns the session and
   wires one turn: extract → orchestrate → respond.
-- **Extractor** (`extractors/`) — the only place the LLM is used. `LLMExtractor`
+- **Extractor** (`extractors/`) — where the LLM reads input. `LLMExtractor`
   (primary, on by default) converts a message + a context hint into structured
   candidate fields via a strict JSON prompt; `RuleBasedExtractor` (regex/date
   parsing) is the fallback and the reproducible path for CI.
+- **LLM client** (`llm_client.py`) — one provider-agnostic interface over two
+  backends: Anthropic Claude on Google Vertex (default) or OpenAI. Chosen by
+  `LLM_PROVIDER`; the rest of the code doesn't know which is active.
+- **Phraser** (`phraser.py`) — an optional *tone* layer. It rewrites the
+  deterministically-chosen reply to sound natural, but only for safe,
+  non-transactional messages, and never changes meaning (details below).
 - **Orchestrator** — deterministic state machine. Owns the flow, decides when to
   call each API, whether verification passed, and how every error is handled.
 - **Verifier / Validators** — strict name + secondary-factor matching; Luhn,
@@ -50,9 +56,11 @@ Components:
   LLM-vs-rule-based usage. Exposed as `agent.metrics`; printed by the CLI.
 
 Flow is an explicit `Step` enum (`GREETING → AWAIT_ACCOUNT → AWAIT_IDENTITY →
-AWAIT_AMOUNT → AWAIT_CARD → PROCESSING → CLOSED_*`). Payment steps are only
-reachable after `is_verified` is set, so "no payment before verification" is
-structurally guaranteed rather than merely checked.
+AWAIT_AMOUNT → AWAIT_CARD → AWAIT_CONFIRMATION → PROCESSING → CLOSED_*`). Payment
+steps are only reachable after `is_verified` is set, so "no payment before
+verification" is structurally guaranteed rather than merely checked. Card fields
+are collected one at a time, and the API is only called after an explicit
+confirmation (see below).
 
 ## 2. Key decisions and why
 
@@ -72,12 +80,37 @@ where it matters: all flow and security decisions are deterministic code, so the
 same input yields the same outcome even if extraction wording varies at
 temperature 0.
 
+**Identifiers are taken exactly, never "repaired".** The account id selects
+*which* account we verify against, so it must be what the user actually typed.
+The LLM prompt forbids inventing/repairing an id (a typo like "AC1001" -> null,
+not "ACC1001"), and a deterministic shape guard (`normalize_account_id`) accepts
+only "ACC<digits>" (case/space normalised) - anything else is dropped and
+re-asked. This prevents an over-eager model from silently pulling up a valid but
+*different* account. Defense in depth: prompt + code guard + the API's own 404.
+
 **Verification is strict and in-code.** Full name must match exactly AND one of
 DOB / Aadhaar-4 / pincode. Names are case- and spelling-strict (only whitespace
 normalised). Numeric factors compare by value ("4 3 2 1" == "4321"), as real KYC
 systems and the spec's examples require; a value with letters is rejected, not
 salvaged. Stored account fields never enter a response, so DOB/Aadhaar/pincode
 cannot leak.
+
+**Conversational tone without giving the LLM control (Phraser).** To feel like a
+real agent (acknowledge small talk, warm prompts) rather than a rigid form, an
+LLM optionally *rephrases* replies. Crucial guardrails keep this safe: (1) the
+orchestrator still decides the exact message; the phraser only rewords it; (2) it
+runs ONLY on safe intents (greeting, asking for account/identity/amount/card,
+clarifications) - sensitive/transactional messages (the balance, transaction id,
+verification result, payment errors, closings) always use the exact template and
+are never sent to the LLM; (3) the phraser is given only the base message + a
+non-sensitive intent label, never account data; (4) any failure falls back to
+the template. Net: warmer UX, zero new attack surface on the money/identity path.
+Locked in by a test that feeds a deliberately-corrupting fake LLM and asserts the
+balance and transaction-id messages pass through untouched.
+
+**Provider-agnostic LLM.** One `LLMClient` abstracts Claude-on-Vertex (default)
+and OpenAI, so swapping models is a config change, not code. The default is
+Claude Opus 4.5 via Vertex.
 
 **Client-side validation is the primary source of error messages.** Probing the
 live API showed it collapses bad expiry/CVV into a generic `400 invalid_args`.
@@ -93,7 +126,17 @@ clarification without burning a retry. Payment: fixable errors route the user
 back to fix that specific thing; terminal errors and persistent network failure
 close cleanly.
 
-**Security.** Card data is transient and wiped on any terminal outcome; logs
+**Explicit confirmation before charging.** After card details are collected and
+locally validated, the agent shows a summary and asks for a yes/no before
+calling the payment API - no charge happens on the same turn the card is
+completed. The summary is a *safe subset* (amount + card last-4 + expiry) -
+never the full PAN or CVV - and is a deterministic template, never LLM-reworded.
+Consent is decided in code (the LLM only *detects* yes/no); an ambiguous reply
+re-asks and does NOT charge (safe default), and "no" cancels cleanly without a
+charge. Card collection is also one field at a time for a natural flow.
+
+**Security.** Card data is transient and wiped on any terminal outcome (incl.
+cancellation); logs
 redact the PAN and mask the CVV; the CVV is dropped after every authorisation
 attempt (PCI hygiene) and re-requested on retry; data volunteered before
 verification is not captured (enforcing no-early-payment / no-step-skipping).

@@ -177,8 +177,9 @@ def all_scenarios() -> list[Scenario]:
                 Turn(
                     "the card number is 4532 0151 1283 0366, expires December 2027, "
                     "CVV is one two three, name on card Nithin Jain",
-                    [msg_contains("recap", "transaction id"), has_transaction()],
+                    [msg_contains("confirm")],
                 ),
+                Turn("yes", [msg_contains("recap", "transaction id"), has_transaction()]),
             ],
             final_checks=[step_is("closed_success"), verified(True),
                           payment_calls(1), last_payment_amount(1000.0)],
@@ -194,7 +195,8 @@ def all_scenarios() -> list[Scenario]:
                 Turn("Aadhaar ends with 9876", [verified(True), no_sensitive_leak()]),
                 Turn("just clear the full amount", [msg_contains("card")]),
                 Turn("4532 0151 1283 0366, 12/27, cvv 123, name Raja",
-                     [msg_contains("recap", "transaction id"), has_transaction()]),
+                     [msg_contains("confirm")]),
+                Turn("yes", [msg_contains("recap", "transaction id"), has_transaction()]),
             ],
             final_checks=[step_is("closed_success"), last_payment_amount(540.0)],
         ),
@@ -269,7 +271,8 @@ def all_scenarios() -> list[Scenario]:
                 Turn("dob 1990-05-14", [verified(True)]),
                 Turn("pay 500", []),
                 Turn("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain",
-                     [msg_contains("exceeds"), payment_calls(1)]),
+                     [msg_contains("confirm"), never_charged()]),  # not charged until confirmed
+                Turn("yes", [msg_contains("exceeds"), payment_calls(1)]),
             ],
             # Fixable error routes back to the amount step, not a terminal close.
             final_checks=[step_is("await_amount")],
@@ -286,9 +289,27 @@ def all_scenarios() -> list[Scenario]:
                 Turn("dob 1990-05-14", [verified(True)]),
                 Turn("pay 500", []),
                 Turn("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain",
-                     [msg_contains("amount"), payment_calls(1)]),
+                     [msg_contains("confirm"), never_charged()]),
+                Turn("yes", [msg_contains("amount"), payment_calls(1)]),
             ],
             final_checks=[step_is("await_amount")],
+        ),
+
+        # 5e) Confirmation: user declines at the confirmation step -> cancelled,
+        # card never charged.
+        Scenario(
+            name="payment_declined_at_confirmation",
+            category="payment_failure",
+            turns=[
+                Turn("ACC1001", []),
+                Turn("Nithin Jain", []),
+                Turn("dob 1990-05-14", [verified(True)]),
+                Turn("pay 500", []),
+                Turn("4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain",
+                     [msg_contains("confirm")]),
+                Turn("no, cancel", [msg_contains("cancel"), never_charged()]),
+            ],
+            final_checks=[step_is("closed_failure"), never_charged()],
         ),
 
         # 6) Edge case: leap-year DOB (ACC1004, 1988-02-29) verifies exactly.

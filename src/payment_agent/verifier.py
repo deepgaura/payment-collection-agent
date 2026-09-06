@@ -1,25 +1,28 @@
-"""Strict identity verification.
+"""
+WHAT THIS FILE IS (in one line):
+    The "are you really you?" checker. It compares what the user CLAIMED
+    against what the bank has ON FILE for that account.
 
-Rule (from the assignment):
-    A user is verified if the full name matches EXACTLY, AND at least one of:
-      - date of birth (YYYY-MM-DD)
-      - last 4 digits of Aadhaar
-      - pincode
-    also matches.
+THE RULE (from the assignment):
+    A user passes ONLY if:
+        the full name matches EXACTLY
+        AND at least ONE of these also matches:
+            - date of birth
+            - last 4 digits of Aadhaar
+            - pincode
 
-Hard constraints honoured here:
-- Matching is strict. No fuzzy matching. No case-insensitive name matching.
-- The comparison happens entirely in deterministic code, never in the LLM,
-  so it is reproducible and cannot be talked around by the user.
-- The stored account values are never returned to the caller, so nothing here
-  can leak DOB / Aadhaar / pincode back to the user.
+    Example (account on file = Nithin Jain, dob 1990-05-14, aadhaar 4321):
+        name "Nithin Jain" + dob "1990-05-14"   -> PASS (name + dob match)
+        name "Nithin Jain" + aadhaar "4321"      -> PASS (name + aadhaar match)
+        name "Nithin Raj"  + dob "1990-05-14"    -> FAIL (name is wrong)
+        name "Nithin Jain" + dob "2000-01-01"    -> FAIL (no factor matches)
 
-Name normalisation policy: we compare the name exactly, only collapsing
-internal whitespace runs to a single space and trimming leading/trailing
-whitespace on BOTH sides. This treats "Nithin  Jain" (double space, a typing
-artefact) the same as "Nithin Jain" but does NOT lower-case, transliterate, or
-fuzzy-match. This is the single, explicitly-documented normalisation; case and
-spelling must otherwise match exactly.
+IMPORTANT SAFETY POINTS:
+    - Matching is STRICT. "nithin jain" (lowercase) does NOT match "Nithin Jain".
+      No fuzzy/approximate matching.
+    - This is plain code (no LLM), so it always gives the same answer and can't
+      be "talked around" by the user.
+    - It NEVER returns the stored values, so it can't leak the real DOB/Aadhaar.
 """
 
 from __future__ import annotations
@@ -29,10 +32,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # avoid import cycle at runtime
+if TYPE_CHECKING:  # only for type hints; avoids an import loop at runtime
     from .state import Account, IdentityClaim
 
 
+# The three "second proof" options a user can give (besides the name).
 class SecondaryFactor(str, Enum):
     DOB = "dob"
     AADHAAR = "aadhaar_last4"
@@ -41,57 +45,85 @@ class SecondaryFactor(str, Enum):
 
 @dataclass
 class VerificationOutcome:
+    """The result of a check.
+        verified       = did they pass? (True/False)
+        name_matches   = did the NAME match? (used to give better guidance)
+        factor_matched = which factor matched, if any (dob/aadhaar/pincode)
+    """
     verified: bool
     name_matches: bool
     factor_matched: SecondaryFactor | None = None
 
 
 def _normalise_name(name: str) -> str:
-    """Trim ends and collapse internal whitespace. No case folding."""
+    """
+    Tidy a name for comparison WITHOUT being lenient:
+      - trim spaces at the start/end
+      - squeeze multiple inner spaces into one
+    So "  Nithin   Jain " becomes "Nithin Jain".
+    NOTE: we do NOT change the letters or their case - "nithin" stays "nithin".
+    """
     return re.sub(r"\s+", " ", name.strip())
 
 
 def name_matches(claimed: str | None, actual: str) -> bool:
+    """
+    Do the two names match exactly (after only the tidy-up above)?
+      claimed = what the user typed,  actual = what's on file.
+    "Nithin Jain" vs "Nithin Jain" -> True
+    "nithin jain" vs "Nithin Jain" -> False (case differs -> strict fail)
+    """
     if not claimed:
-        return False
+        return False   # they gave no name -> can't match
     return _normalise_name(claimed) == _normalise_name(actual)
 
 
 def _digits(value: str | None) -> str | None:
-    """Normalise a numeric factor for comparison.
+    """
+    Compare number-based factors (Aadhaar / pincode) by their DIGITS only.
+      "4 3 2 1"  -> "4321"      (spaces are just formatting)
+      "43-21"    -> "4321"
+      "4321abc"  -> None        (has letters/junk -> we reject it, don't guess)
+      None       -> None
 
-    Real identity systems compare the *numeric value*, treating spaces/dashes as
-    display formatting (Aadhaar is officially grouped as "1234 5678 9012"), so
-    "4 3 2 1" == "4321". This is standard and expected - NOT fuzzy matching.
-
-    Defence in depth: we only tolerate digits and the usual separators (space,
-    dash). A value containing letters or other junk (e.g. "4321abc") is treated
-    as no value rather than salvaging digits out of arbitrary text, so the
-    verifier never relies on an upstream layer having sanitised the input.
+    Why strip spaces? Because "4 3 2 1" and "4321" are the SAME number - that's
+    how real ID systems compare them (Aadhaar is even printed in groups). This
+    is NOT fuzzy matching; it's just ignoring formatting.
     """
     if value is None:
         return None
+    # Only allow digits, spaces, and dashes. Anything else = reject.
     if not re.fullmatch(r"[\d\s\-]+", value):
         return None
-    d = re.sub(r"\D", "", value)
+    d = re.sub(r"\D", "", value)   # remove everything that isn't a digit
     return d or None
 
 
 def verify(claim: "IdentityClaim", account: "Account") -> VerificationOutcome:
-    """Return whether the claim satisfies strict verification against account.
-
-    Does not mutate anything and does not expose account values.
     """
+    The main check. Compares the user's `claim` to the stored `account`.
+    Returns a VerificationOutcome (never changes anything, never leaks data).
+    """
+    # STEP 1: The name MUST match. If it doesn't, stop right here - fail.
     nm = name_matches(claim.full_name, account.full_name)
     if not nm:
         return VerificationOutcome(verified=False, name_matches=False)
 
-    # Name matched; now require at least one strict secondary-factor match.
+    # STEP 2: Name matched. Now we need AT LEAST ONE factor to also match.
+    # Check each one; the first match means success.
+
+    # (a) date of birth
     if claim.dob and claim.dob == account.dob:
         return VerificationOutcome(True, True, SecondaryFactor.DOB)
+
+    # (b) Aadhaar last 4 (compared by digits only)
     if _digits(claim.aadhaar_last4) and _digits(claim.aadhaar_last4) == _digits(account.aadhaar_last4):
         return VerificationOutcome(True, True, SecondaryFactor.AADHAAR)
+
+    # (c) pincode (compared by digits only)
     if _digits(claim.pincode) and _digits(claim.pincode) == _digits(account.pincode):
         return VerificationOutcome(True, True, SecondaryFactor.PINCODE)
 
+    # STEP 3: Name was right, but NO factor matched -> not verified.
+    # (name_matches=True lets the caller know the name itself was fine.)
     return VerificationOutcome(verified=False, name_matches=True)

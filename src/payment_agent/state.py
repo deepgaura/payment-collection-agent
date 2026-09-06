@@ -30,6 +30,7 @@ class Step(str, Enum):
     AWAIT_IDENTITY = "await_identity"  # collecting name + secondary factor
     AWAIT_AMOUNT = "await_amount"      # verified; collecting payment amount
     AWAIT_CARD = "await_card"          # collecting card details
+    AWAIT_CONFIRMATION = "await_confirmation"  # card ready; awaiting user's go-ahead
     PROCESSING = "processing"          # about to call payment API
     CLOSED_SUCCESS = "closed_success"  # terminal: payment succeeded
     CLOSED_FAILURE = "closed_failure"  # terminal: gave up / unrecoverable
@@ -125,23 +126,23 @@ class CardDetails:
             )
         )
 
-    def missing_fields(self) -> list[str]:
-        labels = {
-            "cardholder_name": "cardholder name",
-            "card_number": "card number",
-            "cvv": "CVV",
-            "expiry": "expiry (month and year)",
-        }
-        missing: list[str] = []
-        if not self.cardholder_name:
-            missing.append(labels["cardholder_name"])
+    def next_missing_field(self) -> Optional[str]:
+        """Return the FIRST still-missing card field, in the order we ask for
+        them (number -> expiry -> cvv -> name), or None if complete.
+
+        Collecting one field at a time gives a natural, call-centre-like flow.
+        We still accept multiple fields in one message (greedy capture upstream);
+        this only decides which single field to *prompt* for next.
+        """
         if not self.card_number:
-            missing.append(labels["card_number"])
-        if not self.cvv:
-            missing.append(labels["cvv"])
+            return "card_number"
         if self.expiry_month is None or self.expiry_year is None:
-            missing.append(labels["expiry"])
-        return missing
+            return "expiry"
+        if not self.cvv:
+            return "cvv"
+        if not self.cardholder_name:
+            return "cardholder_name"
+        return None
 
 
 @dataclass

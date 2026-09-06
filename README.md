@@ -23,20 +23,27 @@ pip install -r requirements.txt
 python cli.py
 ```
 
-This is an LLM agent: the **LLM extractor is the primary NLU layer and is on by
-default**. Provide an OpenAI key (e.g. in a local `.env` file) and it interprets
-the messy natural language; deterministic code owns verification, validation,
-and the flow.
+This is an LLM agent: the **LLM is the primary NLU layer (on by default)** and
+also powers an optional conversational tone layer. It supports two providers -
+**Anthropic Claude on Google Vertex (default)** or **OpenAI** - selected by
+`LLM_PROVIDER`. Configure via a local `.env` (git-ignored); see `.env.example`.
 
 ```bash
-# .env  (git-ignored)
-OPENAI_API_KEY=sk-...
-USE_LLM=true
+# .env  — Claude on Vertex (uses `gcloud auth application-default login`)
+LLM_PROVIDER=vertex
+ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project
+CLOUD_ML_REGION=europe-west1
+ANTHROPIC_MODEL=claude-opus-4-5@20251101
+
+# …or OpenAI
+# LLM_PROVIDER=openai
+# OPENAI_API_KEY=sk-...
 ```
 
-If no key is present, or an LLM call fails, the agent transparently falls back
-to a deterministic rule-based extractor so it always runs and never breaks a
-turn. To force the offline path (e.g. for fully reproducible CI), set
+Deterministic code owns verification, validation, and the flow. If no provider
+is configured, or an LLM call fails, the agent transparently falls back to a
+deterministic rule-based extractor and template replies, so it always runs and
+never breaks a turn. To force the fully offline/reproducible path, set
 `USE_LLM=false`.
 
 On determinism: all flow, verification, validation, and API decisions are
@@ -94,9 +101,10 @@ python -m eval.run_eval --live
 python -m eval.personas
 ```
 
-The offline harness reports **14/14 scenarios, 73/73 checks, and tool-call
-correctness 16/16**. Payment-failure coverage includes invalid card, expired
-card, server-side insufficient_balance, and server-side invalid_amount. The LLM
+The offline harness reports **15/15 scenarios, 85/85 checks, and tool-call
+correctness 20/20**. Payment-failure coverage includes invalid card, expired
+card, server-side insufficient_balance, server-side invalid_amount, and a user
+declining at the confirmation step. The LLM
 persona simulator reports **3/3 personas correct** (terse legit and chatty legit
 both pay; impostor is rejected and never charged). See `EVALUATION.md` for the
 full approach and what "correct" means per step, and `DESIGN.md` for the
@@ -121,6 +129,8 @@ src/payment_agent/
     base.py                  # Extractor interface + ExtractionResult
     llm.py                   # LLM NLU (primary, on by default; engineered prompt)
     rule_based.py            # deterministic NLU (fallback + reproducible CI path)
+  llm_client.py              # provider-agnostic client: Claude/Vertex or OpenAI
+  phraser.py                 # optional conversational tone layer (safe messages only)
   tools/
     payment_api.py           # HTTP client, retry + error normalisation
 tests/                       # pytest suite + mock API
@@ -131,44 +141,59 @@ eval/                        # scenario harness, metrics, LLM personas
 
 ## Sample conversations
 
-Captured from a live run of the agent using the **LLM extractor** and the
-**real payment API** (hence the real transaction IDs). This is the default
-mode - the LLM interprets the messy natural language; deterministic code owns
-verification, validation, and the flow.
+Captured from **live runs** using Claude (via Vertex) and the **real payment
+API** (hence the real transaction IDs). The LLM interprets the messy natural
+language and gives the replies their conversational tone; deterministic code
+owns verification, validation, the flow, and every sensitive/transactional
+message (balance, transaction id, errors are exact templates, never
+LLM-generated). Card details are collected one field at a time.
 
-### 1. Successful end-to-end payment
+### 1. Successful end-to-end payment (card collected one field at a time)
 ```
 agent> Hello! I can help you clear your outstanding balance. To get started, could you share your account ID?
-you  > yeah my account number is ACC1001 I think
-agent> Thanks. Could you please confirm your full name as it appears on the account?
-you  > it's Nithin, Nithin Jain
-agent> I have your name. Now I just need ONE of these to verify you: date of birth, last 4 digits of Aadhaar, or pincode.
+you  > hi, i'd like to clear my dues
+agent> Happy to help you clear your dues! I didn't catch an account ID though — it usually looks like 'ACC1001,' could you share yours?
+you  > yeah my account is ACC1001
+agent> Great, thanks! Could you please confirm your full name as it appears on the account?
+you  > it's Nithin Jain
+agent> Got it, Nithin! Now I just need one of these to verify you: your date of birth, last 4 digits of Aadhaar, or your pincode.
 you  > I was born on 14th May 1990
 agent> Identity verified, thank you! Your current outstanding balance is ₹1,250.75. How much would you like to pay today? You can pay the full amount or a partial amount.
-you  > I want to pay a thousand rupees
-agent> Got it - ₹1,000.00. Now I'll need your card details: the card number, expiry (month and year), CVV, and the name on the card.
-you  > the card number is 4532 0151 1283 0366, expires December 2027, CVV is one two three, name on card Nithin Jain
+you  > let me pay a thousand
+agent> Great, ₹1,000.00 it is! Let's get your card details - can you start with your card number?
+you  > 4532 0151 1283 0366
+agent> Got it, thanks! What's the expiry date on that card—month and year?
+you  > expires December 2027
+agent> Perfect, December 2027 noted. And what's the CVV — that 3 or 4 digit code on your card?
+you  > cvv is one two three
+agent> Thanks for that! Just need the name as it appears on the card.
+you  > Nithin Jain
+agent> Please confirm before I process the payment:
+       - Amount: ₹1,000.00
+       - Card ending 0366, expiry 12/2027
+       Shall I go ahead? (yes / no)
+you  > yes go ahead
 agent> All done! Here's a quick recap:
        - Account: ACC1001
        - Amount paid: ₹1,000.00
-       - Transaction ID: txn_1788089911446_xdsjaun
+       - Transaction ID: txn_1788441198907_exg39s6
        Your remaining balance is ₹250.75. Thank you for your payment. This session is now complete - take care!
 ```
 
 ### 2. Verification failure (retries exhausted)
 
-Note how the correct name is kept across attempts - only the mismatched factor
-is re-requested - and a failed *factor* does not force re-typing the name.
+The correct name is kept across attempts - only the mismatched factor is
+re-requested - and the agent never reveals which stored value it checked.
 ```
 agent> Hello! I can help you clear your outstanding balance. To get started, could you share your account ID?
 you  > ACC1001
-agent> Thanks. Could you please confirm your full name as it appears on the account?
+agent> Got it, thanks! Could you please confirm your full name exactly as it appears on the account?
 you  > Nithin Jain
-agent> I have your name. Now I just need ONE of these to verify you: date of birth, last 4 digits of Aadhaar, or pincode.
+agent> Thanks, Nithin! I just need one thing to verify you—your date of birth, last 4 digits of your Aadhaar, or your pincode.
 you  > my dob is 2000-01-01
-agent> Thanks - I've got your name, but that detail didn't match our records. You have 2 attempts remaining. Could you share one of: date of birth, Aadhaar last 4, or pincode?
+agent> Thanks for that! I've got your name down, but unfortunately that date of birth didn't match what we have on file. You've got 2 attempts left — could you try your Aadhaar last 4 digits or your pincode instead?
 you  > aadhaar 1111
-agent> Thanks - I've got your name, but that detail didn't match our records. You have 1 attempt remaining. Could you share one of: date of birth, Aadhaar last 4, or pincode?
+agent> Thanks for that! Unfortunately, those digits didn't match what we have on file. You've got one attempt left — could you try your date of birth, Aadhaar last 4, or pincode instead?
 you  > pincode 999999
 agent> I'm sorry, but I couldn't verify your identity after several attempts, so I can't proceed for security reasons. Please contact support for help. Take care!
 ```
@@ -176,43 +201,46 @@ agent> I'm sorry, but I couldn't verify your identity after several attempts, so
 ### 3. Payment failure (expired card caught locally, then recovery)
 
 The expired card is caught by client-side validation *before* any API call, the
-user gets a clear reason, and the flow recovers with a valid card. (An invalid
-card number - failing the Luhn check - is handled the same way.)
+user gets a clear reason, and the flow recovers. (An invalid card number -
+failing the Luhn check - is handled the same way.)
 ```
 agent> Hello! I can help you clear your outstanding balance. To get started, could you share your account ID?
 you  > acc1001
-agent> Thanks. Could you please confirm your full name as it appears on the account?
+agent> Perfect, thank you! Could you please confirm your full name as it appears on the account?
 you  > Nithin Jain
-agent> I have your name. Now I just need ONE of these to verify you: date of birth, last 4 digits of Aadhaar, or pincode.
+agent> Thanks, Nithin! Now I just need one of these to verify you: your date of birth, last 4 digits of Aadhaar, or your pincode.
 you  > dob 1990-05-14
 agent> Identity verified, thank you! Your current outstanding balance is ₹1,250.75. How much would you like to pay today? You can pay the full amount or a partial amount.
 you  > pay 500
-agent> Got it - ₹500.00. Now I'll need your card details: the card number, expiry (month and year), CVV, and the name on the card.
-you  > 4532 0151 1283 0366, expiry 01/2020, cvv 123, name Nithin Jain
-agent> That card appears to have expired. Please use a card that is still valid.
-you  > ok try 4532 0151 1283 0366, 12/27, cvv 123, name Nithin Jain
+agent> Noted – ₹500.00. Let's get your card details. What's your card number?
+you  > 4532 0151 1283 0366
+agent> Got it, thanks! What's the expiry date on that card—month and year?
+you  > expiry 01/2020
+agent> Got it, thanks! And could I get the CVV—that's the 3 or 4 digit code on your card?
+you  > 123
+agent> Got it! And what's the name as it appears on the card?
+you  > Nithin Jain
+agent> Got it, Nithin! Unfortunately, it looks like that card has expired—could you please use one that's still valid?
+you  > oh, the expiry is 12/27
 agent> All done! Here's a quick recap:
        - Account: ACC1001
        - Amount paid: ₹500.00
-       - Transaction ID: txn_1788089933857_yd8d9q1
+       - Transaction ID: txn_1788441343677_5vs34ux
        Your remaining balance is ₹750.75. Thank you for your payment. This session is now complete - take care!
 ```
 
-### 4. Edge case: leap-year DOB + out-of-order info
+### 4. Edge case: zero-balance account (ACC1003)
+
+A verified account with nothing owed is closed cleanly, instead of entering a
+payment loop that would reject every amount.
 ```
 agent> Hello! I can help you clear your outstanding balance. To get started, could you share your account ID?
-you  > my account is ACC1004 and my name is Rahul Mehta
-agent> Thanks, Rahul Mehta. To verify your identity, could you share ONE of the following: your date of birth, the last 4 digits of your Aadhaar, or your pincode?
-you  > 29th February 1988
-agent> Identity verified, thank you! Your current outstanding balance is ₹3,200.50. How much would you like to pay today? You can pay the full amount or a partial amount.
-you  > just clear the full amount
-agent> Got it - ₹3,200.50. Now I'll need your card details: the card number, expiry (month and year), CVV, and the name on the card.
-you  > 4532 0151 1283 0366, 12/27, cvv 123, cardholder Rahul Mehta
-agent> All done! Here's a quick recap:
-       - Account: ACC1004
-       - Amount paid: ₹3,200.50
-       - Transaction ID: txn_1788089941476_25sxedl
-       Your balance is now fully cleared. Thank you for your payment. This session is now complete - take care!
+you  > ACC1003
+agent> Got it, thanks! Could you please confirm your full name as it appears on the account?
+you  > Priya Agarwal
+agent> Thanks, Priya! Now I just need one of the following to verify your account: your date of birth, last 4 digits of your Aadhaar, or your pincode.
+you  > dob 1992-08-10
+agent> Identity verified, thank you! Good news - account ACC1003 has no outstanding balance, so there's nothing to pay right now. Have a great day - this session is now complete!
 ```
 
 In example 4 the leap-year date `1988-02-29` is accepted as valid and matches

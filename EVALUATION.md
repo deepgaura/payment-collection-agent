@@ -6,7 +6,7 @@ where it struggles. Two complementary layers: a deterministic scenario harness
 
 ## Test cases
 
-The scenario harness (`eval/scenarios.py`) defines **14 scenarios** covering all
+The scenario harness (`eval/scenarios.py`) defines **15 scenarios** covering all
 four required categories:
 
 **Happy path (2)**
@@ -17,11 +17,13 @@ four required categories:
 - `verification_failure_exhausted` — wrong factor 3×, clean lockout.
 - `verification_wrong_name` — correct factor but wrong name is rejected.
 
-**Payment failure (4)**
+**Payment failure (5)**
 - `payment_invalid_card_local` — Luhn failure caught locally, never charged.
 - `payment_expired_card_local` — expired card caught locally, never charged.
 - `payment_insufficient_balance_server` — server 422, routed back to fix amount.
 - `payment_invalid_amount_server` — server 422, communicated clearly.
+- `payment_declined_at_confirmation` — user says no at the confirmation step;
+  cancelled cleanly, card never charged.
 
 **Edge cases (6)**
 - `edge_leap_year_exact` — 1988-02-29 verifies.
@@ -57,11 +59,11 @@ names "correctness of tool calls"), including the negative assertions above.
 Deterministic; uses a mock API so tool calls can be asserted precisely. Latest:
 
 ```
-Scenario success rate   : 14/14 (100.0%)
-Check-level accuracy     : 73/73 (100.0%)
-Tool-call correctness    : 16/16 (100.0%)
+Scenario success rate   : 15/15 (100.0%)
+Check-level accuracy     : 85/85 (100.0%)
+Tool-call correctness    : 20/20 (100.0%)
 ```
-Unit + flow tests (`python -m pytest`): **86 passing**.
+Unit + flow tests (`python -m pytest`): **92 passing**.
 
 **2. LLM persona simulator — `python -m eval.personas`**
 Mirrors the stated evaluation method: an LLM role-plays users (terse legit,

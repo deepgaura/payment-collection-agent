@@ -1,26 +1,22 @@
-"""LLM-backed extractor (primary NLU layer).
+"""
+WHAT THIS FILE IS (in one line):
+    The smart translator: it asks an LLM to read the user's messy sentence and
+    return clean fields as JSON.
 
-Responsibility (and ONLY this): read the user's raw message plus a hint about
-what the agent currently expects, and return structured candidate fields as
-JSON. It never verifies, validates, decides flow, or sees stored account data.
+HOW IT WORKS (3 steps):
+    1. Send the user's message + a rulebook (SYSTEM_PROMPT) to the LLM.
+    2. The LLM replies with JSON like {"account_id": "ACC1001", ...}.
+    3. We clean/sanity-check that JSON and return it as an ExtractionResult.
 
-Prompt-engineering choices, and why:
-- Single, tightly-scoped task ("extract fields to JSON"). Narrow tasks are
-  where LLMs are most reliable; we do not ask it to reason about the flow.
-- Strict JSON schema via response_format=json_object + an explicit schema in
-  the system prompt, so output is machine-parseable every turn.
-- Temperature 0 for maximum determinism.
-- "Only extract what is explicitly present; use null otherwise" - this
-  suppresses hallucination, which is critical when the fields feed identity
-  verification and payment.
-- Dates are returned as the user's raw phrase (dob_text); we parse/normalise
-  them with deterministic code, not the model, so leap-year / format edge
-  cases are handled predictably.
-- Defence in depth: the model output is merged with the deterministic
-  rule-based extractor and then fully re-validated downstream. A wrong or
-  adversarial extraction cannot bypass verification or validation.
-- Robustness: any error (timeout, bad JSON, missing key) falls back to the
-  rule-based extractor. The agent never breaks because the LLM misbehaved.
+SAFETY / KEY IDEAS:
+    - The LLM ONLY extracts data. It never verifies, never decides, never sees
+      the stored account. So it can't bypass any security check.
+    - "Only extract what's actually there; otherwise null" -> stops the LLM from
+      making things up (very important for identity/card fields).
+    - If the LLM fails for ANY reason (timeout, bad JSON), we fall back to the
+      rule-based (regex) translator. The agent never breaks.
+    - The LLM's answer is later merged with the regex answer AND re-validated,
+      so a wrong guess can't slip through.
 """
 
 from __future__ import annotations
@@ -36,6 +32,13 @@ from .rule_based import RuleBasedExtractor
 
 logger = logging.getLogger("payment_agent.llm")
 
+# ---------------------------------------------------------------------------
+# THE RULEBOOK WE SEND THE LLM (the "system prompt").
+# This is the actual text sent to the model. It tells it: "return ONLY this
+# exact JSON shape, fill in what's clearly present, use null otherwise, and
+# never invent anything." Getting this prompt right is the core of making the
+# LLM reliable - so we're very explicit about every field.
+# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
 You are a precise information-extraction component inside a payment-collection \
 agent. You do NOT talk to the user, make decisions, or verify anything. Your \
@@ -46,7 +49,7 @@ Return a JSON object with EXACTLY these keys (use null when a field is not \
 clearly present in THIS message):
 
 {
-  "account_id": string|null,        // normalise to "ACC" + digits, e.g. "acc 1001" -> "ACC1001"
+  "account_id": string|null,        // ONLY if the user's text contains "ACC"+digits (case/space aside), e.g. "acc 1001"->"ACC1001". Do NOT invent or repair: "AC1001", "A1001", or a bare number are NOT account ids -> null.
   "full_name": string|null,         // the person's FULL name if stated; prefer an explicit "full name is X"
   "dob_text": string|null,          // the raw date phrase EXACTLY as the user wrote it; do NOT reformat
   "aadhaar_last4": string|null,     // exactly 4 digits if the user gives Aadhaar last 4
@@ -58,7 +61,8 @@ clearly present in THIS message):
   "cvv": string|null,               // digits only, e.g. "one two three" -> "123"
   "expiry_month": integer|null,     // 1-12
   "expiry_year": integer|null,      // 4-digit year, e.g. "27" -> 2027
-  "wants_to_quit": boolean          // true if the user wants to cancel/stop
+  "wants_to_quit": boolean,         // true if the user wants to cancel/stop
+  "confirm": true|false|null        // at a yes/no confirmation: true=go ahead, false=no/change, null=neither
 }
 
 Rules:
@@ -76,60 +80,70 @@ fields (e.g. a stated account id).
 _ALLOWED_KEYS = {
     "account_id", "full_name", "dob_text", "aadhaar_last4", "pincode",
     "amount", "pay_full_balance", "cardholder_name", "card_number", "cvv",
-    "expiry_month", "expiry_year", "wants_to_quit",
+    "expiry_month", "expiry_year", "wants_to_quit", "confirm",
 }
 
-
 class LLMExtractor:
-    """Primary extractor. Delegates to `fallback` on any failure."""
+    """
+    The smart (LLM) translator.
 
-    source = "llm"
+    Holds two things:
+      - self._client   : the connection to the LLM (Claude/OpenAI)
+      - self._fallback : the rule-based (regex) translator, used if the LLM fails
+    """
 
-    def __init__(self, config: Config, fallback: Optional[RuleBasedExtractor] = None):
+    source = "llm"   # stamped onto results so we know the LLM produced them
+
+    def __init__(self, config: Config, fallback: Optional[RuleBasedExtractor] = None, client=None):
         self._config = config
+        # Backup translator (regex). Used whenever the LLM can't answer.
         self._fallback = fallback or RuleBasedExtractor()
-        # Import lazily so the package works without the openai dependency.
-        from openai import OpenAI
+        # The LLM connection (works for Claude or OpenAI). Built here unless a
+        # test injects its own.
+        if client is None:
+            from ..llm_client import LLMClient
 
-        self._client = OpenAI(api_key=config.llm_api_key, timeout=config.llm_timeout_seconds)
+            client = LLMClient(config)
+        self._client = client
 
     def extract(self, text: str, expecting: Expecting) -> ExtractionResult:
+        # 1) Run the cheap, always-works regex translator first. We'll use it to
+        #    fill any boxes the LLM leaves empty.
         rule_based = self._fallback.extract(text, expecting)
+
+        # 2) Try the LLM.
         try:
             llm_result = self._call_llm(text, expecting)
-        except Exception as exc:  # timeout, network, bad JSON, SDK error...
+        except Exception as exc:
+            # If the LLM errored (timeout/network/bad JSON), DON'T crash - just
+            # use the regex result and make a note that the LLM failed.
             logger.warning("LLM extraction failed (%s); using rule-based only.", exc.__class__.__name__)
             rule_based.notes.append("llm_failed")
             return rule_based
 
-        # LLM is primary; deterministic regex fills any gaps it missed.
+        # 3) LLM leads; regex fills the gaps. Return the combined form.
         llm_result.merge_missing_from(rule_based)
         return llm_result
 
     def _call_llm(self, text: str, expecting: Expecting) -> ExtractionResult:
+        # Build the "user message" part: what the user said + what we expect.
+        # (The rulebook is the SYSTEM_PROMPT defined above.)
         user_prompt = (
             f'expecting: "{expecting.value}"\n'
             f'user_message: {json.dumps(text)}\n'
             f"Extract the fields as specified and return ONLY the JSON object."
         )
-        resp = self._client.chat.completions.create(
-            model=self._config.llm_model,
-            temperature=self._config.llm_temperature,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
+        # Ask the LLM for JSON, then turn that JSON into our form object.
+        data = self._client.complete_json(SYSTEM_PROMPT, user_prompt)
         return self._to_result(data)
 
     def _to_result(self, data: dict) -> ExtractionResult:
-        """Coerce raw LLM JSON into a typed, sanitised ExtractionResult.
+        """
+        Turn the LLM's raw JSON into a clean ExtractionResult.
 
-        We defensively normalise types and ignore unexpected keys, so a
-        slightly-off model response can never corrupt downstream logic.
+        We do NOT blindly trust the JSON. We keep only recognised keys and force
+        each value into the right type, so a slightly-wrong reply can't corrupt
+        the rest of the app.
         """
         clean = {k: v for k, v in data.items() if k in _ALLOWED_KEYS}
         result = ExtractionResult(source=self.source)
@@ -147,11 +161,18 @@ class LLMExtractor:
         result.expiry_month = _as_int(clean.get("expiry_month"))
         result.expiry_year = _as_int(clean.get("expiry_year"))
         result.wants_to_quit = bool(clean.get("wants_to_quit", False))
+        c = clean.get("confirm", None)
+        result.confirm = c if isinstance(c, bool) else None
         return result
 
 
-# --- defensive coercion helpers -------------------------------------------- #
+# --- small "make sure it's the right type" helpers ------------------------- #
+# The LLM's JSON values might be slightly off (a number as text, extra spaces,
+# etc.). These helpers force each value into what we expect, returning None if
+# it can't be made sense of - so bad data becomes "empty", never a crash.
+
 def _as_str(v) -> Optional[str]:
+    # Return a trimmed string, or None if empty/missing. e.g. "  Nithin " -> "Nithin"
     if v is None:
         return None
     s = str(v).strip()
@@ -159,6 +180,7 @@ def _as_str(v) -> Optional[str]:
 
 
 def _as_digits(v) -> Optional[str]:
+    # Keep only the digits. e.g. "4532 0151" -> "45320151", "abc" -> None
     if v is None:
         return None
     d = re.sub(r"\D", "", str(v))
@@ -166,6 +188,7 @@ def _as_digits(v) -> Optional[str]:
 
 
 def _as_int(v) -> Optional[int]:
+    # Turn into a whole number, or None. e.g. "12" -> 12, "dec" -> None
     try:
         return int(v)
     except (TypeError, ValueError):
@@ -173,6 +196,7 @@ def _as_int(v) -> Optional[int]:
 
 
 def _as_float(v) -> Optional[float]:
+    # Turn into a decimal number, or None. e.g. "500" -> 500.0, "lots" -> None
     try:
         return float(v)
     except (TypeError, ValueError):

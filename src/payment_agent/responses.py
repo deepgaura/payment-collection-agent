@@ -101,16 +101,50 @@ class Responses:
 
     @staticmethod
     def amount_confirmed(amount: float) -> str:
+        # Confirm the amount, then ask for the FIRST card field only. We collect
+        # card details one at a time for a natural, call-centre-like flow.
         return (
-            f"Got it - {format_currency(amount)}. Now I'll need your card details: "
-            "the card number, expiry (month and year), CVV, and the name on the card."
+            f"Got it - {format_currency(amount)}. Let's take your card details. "
+            "First, what's your card number?"
         )
 
-    # --- card -------------------------------------------------------------- #
+    # --- card (collected one field at a time) ------------------------------ #
+    # A friendly prompt per field, asked in this order.
+    _CARD_FIELD_PROMPTS = {
+        "card_number": "What's your card number?",
+        "expiry": "Thanks. What's the card's expiry (month and year)?",
+        "cvv": "Got it. And the CVV (the 3 or 4 digit code)?",
+        "cardholder_name": "Almost there - what's the name as it appears on the card?",
+    }
+
     @staticmethod
-    def ask_card_fields(missing: list[str]) -> str:
-        joined = ", ".join(missing)
-        return f"Thanks. I still need: {joined}. Could you share {'that' if len(missing)==1 else 'those'}?"
+    def ask_card_field(field: str) -> str:
+        """Ask for a single card field (one-at-a-time collection)."""
+        return Responses._CARD_FIELD_PROMPTS.get(
+            field, "Could you share the remaining card detail?"
+        )
+
+    # --- confirmation before charging -------------------------------------- #
+    @staticmethod
+    def confirm_payment(amount: float, card_last4: str, exp_month: int, exp_year: int) -> str:
+        # Safe summary only: amount + card LAST 4 + expiry. Never the full card
+        # number or CVV. Shown before we charge so the user can back out.
+        return (
+            "Please confirm before I process the payment:\n"
+            f"- Amount: {format_currency(amount)}\n"
+            f"- Card ending {card_last4}, expiry {exp_month:02d}/{exp_year}\n"
+            "Shall I go ahead? (yes / no)"
+        )
+
+    CONFIRM_UNCLEAR = (
+        "Just to be safe, I didn't catch a clear yes or no. Shall I go ahead "
+        "with the payment? Please reply 'yes' to proceed or 'no' to cancel."
+    )
+
+    PAYMENT_CANCELLED = (
+        "No problem - I've cancelled this payment and won't charge your card. "
+        "This session is now complete. Take care!"
+    )
 
     # --- payment outcome --------------------------------------------------- #
     @staticmethod
