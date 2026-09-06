@@ -145,11 +145,12 @@ def test_insufficient_balance_then_retry():
 
 
 # --- Out-of-order handling ------------------------------------------------- #
-def test_out_of_order_name_before_asked():
+def test_name_then_factor_verifies():
     agent = make_agent()
-    # User provides name together with account id.
-    run(agent, ["my account is ACC1001 and my name is Nithin Jain"])
-    # Name should already be captured; providing DOB alone should verify.
+    # New behavior: each turn we only capture what that step asks for.
+    # So the account step grabs the account id; the name is given on its
+    # own turn; then a single factor (DOB) completes verification.
+    run(agent, ["my account is ACC1001", "Nithin Jain"])
     msg = agent.next("dob 1990-05-14")["message"]
     assert agent.is_verified
     assert "balance" in msg.lower()

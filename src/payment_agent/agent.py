@@ -94,16 +94,10 @@ class Agent:
         expecting = self._orchestrator.expecting_for(self._state)
 
         # STEP 3: run the TRANSLATOR (this is the ONLY place extract() is called).
+        # We extract ONLY what the current step is asking for - one focused pass.
         try:
             with self.metrics.timer("extraction"):
                 extracted = self._extractor.extract(text, expecting)
-                # Special case: while collecting the account, the user might
-                # ALSO say their name ("my account is ACC1001 and I'm Nithin").
-                # So we run a second pass looking for identity and merge it in,
-                # so we don't lose that early info.
-                if expecting == Expecting.ACCOUNT:
-                    identity_pass = self._extractor.extract(text, Expecting.IDENTITY)
-                    extracted.merge_missing_from(identity_pass)
             # Record whether the LLM or the regex fallback produced this.
             self.metrics.incr(f"extraction.source.{extracted.source}")
             if "llm_failed" in extracted.notes:
@@ -154,8 +148,6 @@ class Agent:
         """
         if not text:
             return False
-        from .extractors.base import Expecting
-
         try:
             ex = self._extractor.extract(text, Expecting.ACCOUNT)
             return bool(ex.account_id)

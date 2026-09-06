@@ -366,13 +366,15 @@ def all_scenarios() -> list[Scenario]:
             final_checks=[step_is("closed_success"), payment_calls(0)],
         ),
 
-        # 8) Edge case: out-of-order info (name volunteered with account id).
+        # 8) Edge case: info given step-by-step (one thing per turn).
+        # We intentionally capture only what the current step asks for, so
+        # the account turn grabs the id, the name comes next, then a factor.
         Scenario(
-            name="edge_out_of_order",
+            name="edge_step_by_step",
             category="edge_case",
             turns=[
-                Turn("my account is ACC1001 and my name is Nithin Jain",
-                     [msg_contains("verify")]),
+                Turn("my account is ACC1001", [msg_contains("name")]),
+                Turn("Nithin Jain", [msg_contains("verify")]),
                 Turn("DOB is May 14, 90", [verified(True)]),
             ],
             final_checks=[verified(True)],
